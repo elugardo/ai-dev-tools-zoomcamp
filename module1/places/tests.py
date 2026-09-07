@@ -2,6 +2,7 @@ import unittest
 
 from django.apps import apps
 from django.core.exceptions import ValidationError
+from django.core.management import call_command
 from django.db import IntegrityError, transaction
 from django.db.models import Q
 from django.test import SimpleTestCase, TestCase
@@ -9,11 +10,47 @@ from django.test import SimpleTestCase, TestCase
 from places.models import Place, Tag, normalize_tag_name
 
 
-class ProjectSkeletonTests(SimpleTestCase):
+class ProjectSkeletonTests(unittest.TestCase):
     """Smoke tests proving the places app is wired into the project."""
 
     def test_places_app_is_installed(self):
         self.assertTrue(apps.is_installed("places"))
+
+    def test_the_places_app_declares_exactly_two_models(self):
+        """Place and Tag and nothing else -- a third model added later is a
+        design change, not a detail, so it should break a test."""
+        self.assertEqual(
+            sorted(m.__name__ for m in apps.get_app_config("places").get_models()),
+            ["Place", "Tag"],
+        )
+
+
+class ProjectChecksTests(SimpleTestCase):
+    """Django's own checks, run as tests so drift fails the suite.
+
+    No fixtures and no writes, so ``SimpleTestCase`` rather than ``TestCase``.
+    ``databases`` is declared only because ``makemigrations`` reads the
+    ``django_migrations`` table for its consistency check; nothing here writes.
+    """
+
+    databases = {"default"}
+
+    def test_no_model_changes_are_missing_a_migration(self):
+        """``makemigrations --check`` exits non-zero when models and migrations
+        have drifted apart -- the likeliest regression as later issues edit the
+        models."""
+        try:
+            call_command(
+                "makemigrations", "places", check=True, dry_run=True, verbosity=0
+            )
+        except SystemExit:
+            self.fail(
+                "Model changes are not reflected in places/migrations -- "
+                "run: uv run python manage.py makemigrations places"
+            )
+
+    def test_the_project_passes_the_system_check_framework(self):
+        call_command("check", verbosity=0)
 
 
 class NormalizeTagNameTests(unittest.TestCase):
@@ -84,11 +121,28 @@ class TagModelTests(TestCase):
         self.assertEqual(Tag.objects.filter(Q(name="Coffee")).count(), 1)
         self.assertEqual(Tag.objects.get(Q(name="COFFEE")).pk, existing.pk)
 
+    def test_surrounding_whitespace_is_stripped_on_save(self):
+        """The half of normalization the NOCASE collation does *not* cover, so
+        it has to be pinned on the model and not only on the pure function."""
+        tag = Tag.objects.create(name="   Coffee \n")
+        self.assertEqual(tag.name, "coffee")
+        self.assertEqual(Tag.objects.get(pk=tag.pk).name, "coffee")
+
     def test_a_genuine_duplicate_still_violates_the_unique_constraint(self):
         Tag.objects.create(name="coffee")
         with self.assertRaises(IntegrityError):
             with transaction.atomic():
                 Tag.objects.create(name="coffee")
+
+    def test_a_mixed_case_duplicate_is_rejected_when_save_is_bypassed(self):
+        """``bulk_create`` skips ``save()``, so no Python-side normalization
+        runs -- what rejects this row is the case-insensitive UNIQUE index the
+        ``NOCASE`` collation builds. Remove ``db_collation`` from ``Tag.name``
+        and this is the test that fails."""
+        Tag.objects.create(name="coffee")
+        with self.assertRaises(IntegrityError):
+            with transaction.atomic():
+                Tag.objects.bulk_create([Tag(name="COFFEE")])
 
     def test_full_clean_rejects_a_duplicate_that_differs_only_in_case(self):
         Tag.objects.create(name="coffee")
