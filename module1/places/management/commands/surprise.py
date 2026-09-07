@@ -101,6 +101,20 @@ NEVER_VISITED_REASON = "never visited"
 UNKNOWN_DATE_REASON = "visited, date unknown"
 
 
+def age_of(place, now):
+    """How long ago ``place`` was last visited, as a never-negative timedelta.
+
+    A ``last_visited_at`` in the future -- clock skew, or a typo in the admin
+    -- is clamped to zero. One clamp, in one place, because both the weight
+    and the printed reason are computed from this: an unclamped age would put
+    a future visit on a rung it does not belong to *and* report it as
+    "-400 days ago".
+
+    Only meaningful for a place that has a ``last_visited_at``; callers check.
+    """
+    return max(now - place.last_visited_at, timedelta(0))
+
+
 def weight_for(place, now):
     """How likely ``place`` is to be picked, as a whole number of tickets.
 
@@ -109,15 +123,13 @@ def weight_for(place, now):
     have its last places judged microseconds later than its first.
 
     Never returns 0: every candidate that survives the filters is reachable.
-    A ``last_visited_at`` in the future -- clock skew, or a typo in the admin
-    -- is clamped to age 0 rather than producing a negative age.
     """
     if place.status == Place.Status.WISHLIST:
         return WISHLIST_WEIGHT
     if place.last_visited_at is None:
         return LONG_AGO_WEIGHT
 
-    age = max(now - place.last_visited_at, timedelta(0))
+    age = age_of(place, now)
     if age >= timedelta(days=LONG_AGO_DAYS):
         return LONG_AGO_WEIGHT
     if age >= timedelta(days=RECENT_DAYS):
@@ -242,7 +254,7 @@ class Command(BaseCommand):
             return UNKNOWN_DATE_REASON
 
         stamped = place.last_visited_at.strftime(VISIT_DATE_FORMAT)
-        days = max(now - place.last_visited_at, timedelta(0)).days
+        days = age_of(place, now).days
         if days == 0:
             elapsed = "today"
         elif days == 1:

@@ -4797,6 +4797,18 @@ class SurpriseOutputTests(SurpriseCommandTestCase):
         self.assertNotIn("never visited", out)
         self.assertNotIn("date unknown", out)
 
+    def test_a_visit_dated_in_the_future_reads_as_today_not_as_negative_days(self):
+        """Clock skew, or a typo in the admin. Never "-400 days ago"."""
+        place = _make_place("Time Traveller", status=Place.Status.VISITED)
+        place.last_visited_at = django_timezone.now() + timedelta(days=400)
+        place.save(update_fields=["last_visited_at"])
+
+        out, _ = self.run_surprise(seed=0)
+
+        self.assertIn("today", out)
+        self.assertNotIn("-400", out)
+        self.assertNotIn("days ago", out)
+
     def test_the_three_reasons_are_three_different_strings(self):
         reasons = set()
         for fields in (
