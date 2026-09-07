@@ -4,10 +4,19 @@ Two ``ModelAdmin`` classes and two display methods, per ``_docs/plan.md``. No
 custom views, templates, URLs or admin site -- ``AGENTS.md`` reserves the web
 side for what ``django.contrib.admin`` gives us for free.
 
-Nothing here lowercases a tag name by hand: ``Tag`` normalizes in ``clean()``
-and ``save()`` (issue #2), so the admin form's uniqueness check already runs
-against the canonical name and a typed ``Coffee`` collides with a stored
-``coffee`` as a form error rather than an ``IntegrityError``.
+Nothing here lowercases a tag name by hand. Typing ``Coffee`` into the tag
+form when ``coffee`` is stored comes back as a form error rather than an
+``IntegrityError``, and the mechanism is ``db_collation="NOCASE"`` on
+``Tag.name`` (issue #2): the uniqueness check ``validate_unique()`` runs is an
+ordinary ``filter(name=...)``, and the collation makes SQLite match the stored
+row whatever case was typed, so the conflict is found before the insert.
+``Tag.clean()``'s normalization is defence in depth here, not the mechanism --
+remove it and the collision is still a clean form error.
+
+That guarantee therefore lives in the database, not in Python. Moving this
+project off SQLite, or onto a backend without a case-insensitive collation on
+that column, would put the collision back on the insert; the fix would belong
+in ``models.py`` (issue #2), not here.
 """
 
 from django.contrib import admin
