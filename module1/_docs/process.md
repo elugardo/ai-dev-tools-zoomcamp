@@ -33,6 +33,13 @@ name.
   [`team/software-engineer.md`](team/software-engineer.md). Builds against the
   acceptance criteria without changing them, writes tests, commits regularly, and
   does not close the issue.
+- **QA Engineer** — checks finished work against the issue that specified it,
+  follows [`team/qa-engineer.md`](team/qa-engineer.md). Verifies each criterion,
+  hunts the cases the criteria describe but the tests miss, fixes nothing, and
+  reports PASS or FAIL as an issue comment.
+
+An issue is closed only after QA returns PASS. A FAIL goes back to the engineer,
+who fixes it on the same branch; the cycle repeats until it passes.
 
 ## Order and dependencies
 

@@ -47,4 +47,5 @@ activate. `uv sync` is idempotent — run it after pulling if dependencies moved
   into the four sections of `module1/_docs/task-template.md`.
 - Before implementing a groomed issue, read
   `module1/_docs/team/software-engineer.md`.
+- Before verifying finished work, read `module1/_docs/team/qa-engineer.md`.
 
