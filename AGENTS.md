@@ -8,22 +8,23 @@ from `module1/`, which is where the virtualenv and `manage.py` live.
 ## Commands
 
 ```
-python -m venv .venv                              # first time only
-.venv\Scripts\python -m pip install -r requirements.txt
-.venv\Scripts\python manage.py migrate            # create/update the SQLite db
-.venv\Scripts\python manage.py test               # full test suite
-.venv\Scripts\python manage.py test places.tests.PlaceModelTests   # one test class
-.venv\Scripts\python manage.py check              # config sanity check
-.venv\Scripts\python manage.py createsuperuser    # needed once for the admin
-.venv\Scripts\python manage.py runserver          # admin at localhost:8000/admin/
+uv sync                                       # create .venv and install deps
+uv run python manage.py migrate               # create/update the SQLite db
+uv run python manage.py test                  # full test suite
+uv run python manage.py test places.tests.PlaceModelTests   # one test class
+uv run python manage.py check                 # config sanity check
+uv run python manage.py createsuperuser       # needed once for the admin
+uv run python manage.py runserver             # admin at localhost:8000/admin/
 ```
 
-Shell is PowerShell on Windows. In bash use `.venv/Scripts/python.exe` instead.
+`uv run` executes inside the project environment, so there is nothing to
+activate. `uv sync` is idempotent — run it after pulling if dependencies moved.
 
 ## Rules
 
-- Dependencies are pinned in `module1/requirements.txt`. Do not add one without
-  asking.
+- Dependencies are declared in `module1/pyproject.toml` and pinned in
+  `module1/uv.lock`. Add them with `uv add <pkg>`, never by editing the lock by
+  hand — and do not add one without asking.
 - The tool is **fully offline**. No network calls, no API keys, no geocoding, no
   LLM calls at runtime. If a task seems to need one, stop and ask.
 - The CLI is built from Django management commands in

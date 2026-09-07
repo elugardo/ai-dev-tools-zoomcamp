@@ -95,8 +95,8 @@ wall of zeros.
 
 ## 10. README and recorded session
 Goal: A newcomer can install, run, and understand the tool from the README alone.
-Description: Write `module1/README.md` covering setup (venv, `requirements.txt`,
-`migrate`, superuser), a one-line description of every command, and a walkthrough
+Description: Write `module1/README.md` covering setup (`uv sync`, `migrate`,
+superuser), a one-line description of every command, and a walkthrough
 that adds several real places, finds one by a half-remembered detail, marks it
 visited, and prints stats. Paste the actual terminal output rather than
 idealized examples. Confirm the instructions work from a clean clone with a fresh

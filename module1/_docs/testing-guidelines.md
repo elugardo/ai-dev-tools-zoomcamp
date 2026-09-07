@@ -5,8 +5,8 @@ with no test is not finished.
 
 ## Mechanics
 
-- Django's own runner: `.venv\Scripts\python manage.py test`. No pytest — it is
-  not in `requirements.txt` and would need approval to add.
+- Django's own runner: `uv run python manage.py test`. No pytest — it is not a
+  dependency in `pyproject.toml` and would need approval to add.
 - Tests live in `places/tests.py` until it gets unwieldy, then become a
   `places/tests/` package with one module per unit (`test_models.py`,
   `test_search.py`, `test_commands.py`).

@@ -30,10 +30,11 @@ not a neighborhood guide.
 
 ### Stack
 
-Python + Django 6.1 with SQLite. The interface is a CLI built from Django
-management commands (`python manage.py add`, `find`, `todo`, `visit`, `surprise`,
-`stats`), with the stock Django admin as an optional web window onto the same
-data. Fully offline — no API keys, no network calls, no geocoding.
+Python 3.13 + Django 6.1 with SQLite, managed with [uv](https://docs.astral.sh/uv/).
+The interface is a CLI built from Django management commands
+(`uv run python manage.py add`, `find`, `todo`, `visit`, `surprise`, `stats`),
+with the stock Django admin as an optional web window onto the same data. Fully
+offline — no API keys, no network calls, no geocoding.
 
 ### Layout
 
@@ -43,7 +44,8 @@ module1/
 ├── places/         the app — models, admin, management commands
 ├── _docs/          plan, backlog, process, testing guidelines
 ├── manage.py
-└── requirements.txt
+├── pyproject.toml  dependencies (uv)
+└── uv.lock
 ```
 
 ### Documents
