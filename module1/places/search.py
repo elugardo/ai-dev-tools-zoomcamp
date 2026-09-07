@@ -275,7 +275,12 @@ def _text(place, attribute):
 
 
 def _tag_names(place):
-    """Read a candidate's tag names, lowercased, as a tuple of strings.
+    """Read a candidate's tag names as a tuple of raw strings.
+
+    Lowercasing happens once, in :func:`_tokenize`, which every field goes
+    through -- tags included, so ``AGENTS.md``'s "lowercase on read as well as
+    on write" holds here without a second copy of the rule that no test could
+    tell apart from this one.
 
     Entries may be plain strings or objects with a ``.name``. ``place.tags``
     itself may be a plain iterable or a Django related manager -- a manager is
@@ -297,7 +302,7 @@ def _tag_names(place):
     for tag in tags:
         name = tag if isinstance(tag, str) else getattr(tag, "name", None)
         if name:
-            names.append(str(name).strip().lower())
+            names.append(str(name))
     return tuple(names)
 
 
