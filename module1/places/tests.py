@@ -1,9 +1,12 @@
+import ast
 import inspect
 import unittest
 import warnings
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timezone
 from io import StringIO
+from types import SimpleNamespace
+from unittest import mock
 
 from django.apps import apps
 from django.contrib import admin
@@ -18,6 +21,7 @@ from django.test import SimpleTestCase, TestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
+from places import search
 from places.models import Place, Tag, normalize_tag_name
 
 
@@ -1432,3 +1436,536 @@ class AddCommandOutputTests(AddCommandTestCase):
         out, err = self.run_add("Tartine", "--tag", "pastry")
 
         self.assertEqual(err, "")
+
+
+# ---------------------------------------------------------------------------
+# Issue #5 -- the fuzzy ranking module, places/search.py
+#
+# Per _docs/testing-guidelines.md this is the most important test surface in
+# the project, and per the issue it is pure: plain unittest.TestCase, no
+# database, no call_command, no network. Candidates are in-memory stand-ins,
+# which is exactly the point -- search.py must not need places.models.
+# ---------------------------------------------------------------------------
+
+
+def place(name="", note="", neighborhood="", tags=()):
+    """An in-memory candidate: the duck type search.py documents."""
+    return SimpleNamespace(name=name, note=note, neighborhood=neighborhood, tags=tags)
+
+
+class TagRow:
+    """Stands in for a ``Tag`` row: an object carrying a ``.name``."""
+
+    def __init__(self, name):
+        self.name = name
+
+
+class RelatedManager:
+    """Stands in for ``place.tags`` on a real ``Place``: not iterable, has all()."""
+
+    def __init__(self, *rows):
+        self._rows = rows
+
+    def all(self):
+        return list(self._rows)
+
+
+BLUE_BOTTLE = place("Blue Bottle", "good wifi and quiet", "Mitte", ["coffee"])
+RAMEN_SHOP = place("Ramen Shop", "rich tonkotsu broth", "Neukolln", ["ramen"])
+TIERGARTEN = place("Tiergarten", "the big park", "Mitte", ["park"])
+SAMPLE_PLACES = [BLUE_BOTTLE, RAMEN_SHOP, TIERGARTEN]
+
+
+class SearchModuleContractTests(unittest.TestCase):
+    """The rules issue #5 states about the module itself, not its answers.
+
+    Source-level on purpose: "pure, no database, no models" is a property of
+    the code, and a behavioral test would keep passing on the day someone adds
+    a queryset to it that happens to work in their environment.
+    """
+
+    def source(self):
+        return inspect.getsource(search)
+
+    def test_the_module_imports_neither_the_models_nor_django(self):
+        imported = set()
+        for node in ast.walk(ast.parse(self.source())):
+            if isinstance(node, ast.Import):
+                imported.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom):
+                imported.add(node.module or "")
+
+        for module in imported:
+            self.assertFalse(
+                module == "places.models"
+                or module.startswith("django")
+                or module.startswith("places.management"),
+                "search.py must stay pure but imports " + module,
+            )
+
+    def test_the_module_performs_no_database_access_of_its_own(self):
+        source = self.source()
+
+        self.assertNotIn(".objects", source)
+        self.assertNotIn("select_related", source)
+        self.assertNotIn("prefetch_related", source)
+        self.assertNotIn("filter(", source)
+
+    def test_the_module_neither_prints_nor_writes(self):
+        """Calls, not text: the docstring shows the caller printing, which is
+        the point -- the module returns a value and prints nothing itself."""
+        called = set()
+        for node in ast.walk(ast.parse(self.source())):
+            if isinstance(node, ast.Call):
+                if isinstance(node.func, ast.Name):
+                    called.add(node.func.id)
+                elif isinstance(node.func, ast.Attribute):
+                    called.add(node.func.attr)
+
+        self.assertNotIn("print", called)
+        self.assertNotIn("open", called)
+        self.assertNotIn("write", called)
+
+    def test_ranking_emits_nothing_on_either_stream(self):
+        out, err = StringIO(), StringIO()
+
+        with redirect_stdout(out), redirect_stderr(err):
+            search.rank_places("blu bottl", SAMPLE_PLACES)
+            search.rank_places("zzzzqqq", SAMPLE_PLACES)
+
+        self.assertEqual((out.getvalue(), err.getvalue()), ("", ""))
+
+    def test_the_docstring_states_the_candidate_contract(self):
+        doc = search.__doc__
+
+        for expected in ("name", "note", "neighborhood", "tags", ".name"):
+            self.assertIn(expected, doc)
+        self.assertIn("lowercase", doc.lower())
+
+    def test_the_tuning_knobs_are_named_module_level_constants(self):
+        self.assertEqual(search.STRONG_MATCH_THRESHOLD, 60)
+        self.assertEqual(search.WEAK_MATCH_LIMIT, 3)
+        self.assertGreater(search.NAME_WEIGHT, search.NOTE_WEIGHT)
+        self.assertGreater(search.NAME_WEIGHT, search.TAG_WEIGHT)
+        self.assertGreater(search.NAME_WEIGHT, search.NEIGHBORHOOD_WEIGHT)
+
+    def test_no_second_copy_of_the_threshold_or_the_weak_limit_is_hard_coded(self):
+        """Both numbers exist once, as their constant. A literal 60 or 3
+        anywhere else in the module is the bug this criterion forbids."""
+        named = {"STRONG_MATCH_THRESHOLD", "WEAK_MATCH_LIMIT"}
+        tree = ast.parse(self.source())
+        declarations = {
+            id(node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id in named
+                for target in node.targets
+            )
+        }
+        self.assertEqual(len(declarations), len(named), "both constants declared once")
+
+        offenders = [
+            (node.lineno, node.value)
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Constant)
+            and id(node) not in declarations
+            and not isinstance(node.value, bool)
+            and isinstance(node.value, (int, float))
+            and node.value in (60, 3)
+        ]
+
+        self.assertEqual(offenders, [])
+
+
+class SearchReturnShapeTests(unittest.TestCase):
+    """Scores, ordering, and what a result set is allowed to contain."""
+
+    def test_every_score_sits_in_the_closed_zero_to_hundred_range(self):
+        for query in ("blue bottle", "blu bottl", "zzzzqqq", "coffee wifi park"):
+            for result in search.rank_places(query, SAMPLE_PLACES):
+                self.assertGreaterEqual(result.score, 0)
+                self.assertLessEqual(result.score, 100)
+
+    def test_results_come_back_best_first(self):
+        results = search.rank_places("coffee", SAMPLE_PLACES)
+        scores = [result.score for result in results]
+
+        self.assertEqual(scores, sorted(scores, reverse=True))
+
+    def test_each_candidate_appears_at_most_once_and_none_are_invented(self):
+        results = search.rank_places("zzzzqqq", SAMPLE_PLACES)
+        returned = [result.place for result in results]
+
+        self.assertEqual(len(returned), len({id(candidate) for candidate in returned}))
+        for candidate in returned:
+            self.assertIn(candidate, SAMPLE_PLACES)
+
+    def test_every_result_carries_its_own_score(self):
+        for result in search.rank_places("blue bottle", SAMPLE_PLACES):
+            self.assertIsInstance(result.score, (int, float))
+
+    def test_the_result_set_is_a_sequence_of_results(self):
+        results = search.rank_places("blue bottle", SAMPLE_PLACES)
+
+        self.assertEqual(len(results), len(list(results)))
+        self.assertIs(results[0].place, BLUE_BOTTLE)
+
+
+class SearchFieldWeightingTests(unittest.TestCase):
+    """Where the query text sits changes the score, in a stated order."""
+
+    #: Four places identical but for which field holds the query word. The
+    #: filler names are chosen to score nothing against "ramen".
+    NAME = place("ramen", note="", neighborhood="", tags=())
+    NOTE = place("Alpha", note="ramen", neighborhood="", tags=())
+    TAG = place("Bravo", note="", neighborhood="", tags=["ramen"])
+    HOOD = place("Charlie", note="", neighborhood="ramen", tags=())
+
+    def scores(self, query, candidates):
+        return {
+            id(result.place): result.score
+            for result in search.rank_places(query, candidates)
+        }
+
+    def test_a_name_match_outranks_the_same_text_in_a_note(self):
+        scores = self.scores("ramen", [self.NAME, self.NOTE])
+
+        self.assertGreater(scores[id(self.NAME)], scores[id(self.NOTE)])
+
+    def test_a_name_match_outranks_the_same_text_in_a_tag(self):
+        scores = self.scores("ramen", [self.NAME, self.TAG])
+
+        self.assertGreater(scores[id(self.NAME)], scores[id(self.TAG)])
+
+    def test_a_name_match_outranks_the_same_text_in_a_neighborhood(self):
+        scores = self.scores("ramen", [self.NAME, self.HOOD])
+
+        self.assertGreater(scores[id(self.NAME)], scores[id(self.HOOD)])
+
+    def test_the_name_match_is_ranked_first_of_all_four(self):
+        results = search.rank_places("ramen", [self.HOOD, self.TAG, self.NOTE, self.NAME])
+
+        self.assertIs(results[0].place, self.NAME)
+
+    def test_two_matching_fields_beat_one(self):
+        """The worked example from the issue: same name, same tag, and only
+        the note decides."""
+        both = place("Blue Bottle", "good wifi", "Mitte", ["coffee"])
+        one = place("Blue Bottle", "good pastries", "Mitte", ["coffee"])
+
+        both_score = search.rank_places("coffee wifi", [both])[0].score
+        one_score = search.rank_places("coffee wifi", [one])[0].score
+
+        self.assertGreater(both_score, one_score)
+        self.assertIs(search.rank_places("coffee wifi", [one, both])[0].place, both)
+
+    def test_a_non_matching_field_costs_nothing(self):
+        """A long irrelevant note must not average the score down."""
+        chatty = place(
+            "Blue Bottle",
+            "the chairs are green and the queue on saturdays runs out the door "
+            "past the bookshop and around the corner towards the bridge",
+            "Mitte",
+            ["coffee"],
+        )
+        terse = place("Blue Bottle", "", "Mitte", ["coffee"])
+
+        chatty_score = search.rank_places("blue bottle", [chatty])[0].score
+        terse_score = search.rank_places("blue bottle", [terse])[0].score
+
+        self.assertGreaterEqual(chatty_score, terse_score)
+
+
+class SearchTypoAndCaseTests(unittest.TestCase):
+    """Typos forgiven, case ignored, whitespace trimmed."""
+
+    def ranked_names(self, query, candidates=None):
+        return [
+            (result.place.name, result.score)
+            for result in search.rank_places(query, candidates or SAMPLE_PLACES)
+        ]
+
+    def test_blu_bottl_finds_blue_bottle_as_a_strong_top_result(self):
+        """The worked example from _docs/task-template.md, literally."""
+        results = search.rank_places("blu bottl", SAMPLE_PLACES)
+
+        self.assertIs(results[0].place, BLUE_BOTTLE)
+        self.assertFalse(results.is_weak)
+        self.assertFalse(results[0].is_weak)
+
+    def test_cofee_finds_the_place_tagged_coffee_without_falling_back(self):
+        results = search.rank_places("cofee", SAMPLE_PLACES)
+
+        self.assertIs(results[0].place, BLUE_BOTTLE)
+        self.assertFalse(results.is_weak)
+
+    def test_ramn_finds_ramen_shop_without_falling_back(self):
+        results = search.rank_places("ramn", SAMPLE_PLACES)
+
+        self.assertIs(results[0].place, RAMEN_SHOP)
+        self.assertFalse(results.is_weak)
+
+    def test_tag_matching_ignores_the_case_of_the_query(self):
+        self.assertEqual(self.ranked_names("COFFEE"), self.ranked_names("coffee"))
+        self.assertEqual(self.ranked_names("Coffee"), self.ranked_names("coffee"))
+
+    def test_tag_matching_ignores_the_case_of_the_stored_tag(self):
+        """AGENTS.md: lowercase on read, never assume the caller normalized."""
+        shouty = place("Alpha", tags=["COFFEE"])
+        titled = place("Alpha", tags=["Coffee"])
+        plain = place("Alpha", tags=["coffee"])
+
+        self.assertEqual(
+            search.rank_places("coffee", [shouty])[0].score,
+            search.rank_places("coffee", [plain])[0].score,
+        )
+        self.assertEqual(
+            search.rank_places("coffee", [titled])[0].score,
+            search.rank_places("coffee", [plain])[0].score,
+        )
+
+    def test_a_tag_row_and_a_plain_string_score_identically(self):
+        rows = place("Alpha", tags=[TagRow("Coffee")])
+        strings = place("Alpha", tags=["coffee"])
+
+        self.assertEqual(
+            search.rank_places("coffee", [rows])[0].score,
+            search.rank_places("coffee", [strings])[0].score,
+        )
+
+    def test_tags_arriving_as_a_related_manager_are_read_too(self):
+        managed = place("Alpha", tags=RelatedManager(TagRow("Coffee")))
+        strings = place("Alpha", tags=["coffee"])
+
+        self.assertEqual(
+            search.rank_places("coffee", [managed])[0].score,
+            search.rank_places("coffee", [strings])[0].score,
+        )
+
+    def test_name_note_and_neighborhood_matching_ignore_case(self):
+        self.assertEqual(
+            self.ranked_names("BLUE BOTTLE"), self.ranked_names("blue bottle")
+        )
+        self.assertEqual(self.ranked_names("MITTE"), self.ranked_names("mitte"))
+        self.assertEqual(self.ranked_names("TONKOTSU"), self.ranked_names("tonkotsu"))
+
+    def test_surrounding_whitespace_on_the_query_is_ignored(self):
+        self.assertEqual(
+            self.ranked_names("  blue bottle  "), self.ranked_names("blue bottle")
+        )
+
+    def test_punctuation_in_the_query_still_returns_a_ranking(self):
+        results = search.rank_places("blue-bottle", SAMPLE_PLACES)
+
+        self.assertIs(results[0].place, BLUE_BOTTLE)
+        self.assertFalse(results.is_weak)
+
+    def test_a_query_far_longer_than_any_field_returns_a_result(self):
+        results = search.rank_places("blue bottle " * 40, SAMPLE_PLACES)
+
+        self.assertGreaterEqual(len(results), 1)
+
+
+class SearchThresholdTests(unittest.TestCase):
+    """One threshold, applied inclusively, dropping everything below it."""
+
+    def test_only_the_candidates_at_or_above_the_threshold_come_back(self):
+        results = search.rank_places("ramn", SAMPLE_PLACES)
+
+        self.assertEqual([result.place for result in results], [RAMEN_SHOP])
+        for result in results:
+            self.assertGreaterEqual(result.score, search.STRONG_MATCH_THRESHOLD)
+
+    def test_the_strong_path_is_not_capped_at_the_weak_limit(self):
+        many = [place("Blue Bottle %d" % index, tags=["coffee"]) for index in range(7)]
+
+        results = search.rank_places("blue bottle", many)
+
+        self.assertFalse(results.is_weak)
+        self.assertEqual(len(results), len(many))
+        self.assertGreater(len(results), search.WEAK_MATCH_LIMIT)
+
+    def test_a_score_exactly_equal_to_the_threshold_counts_as_strong(self):
+        """Inclusive, not exclusive. Pinning the threshold to a score the
+        module actually produced is the only way to hit the boundary exactly
+        without hard-coding today's tuning."""
+        exact = search.rank_places("blu bottl", [BLUE_BOTTLE])[0].score
+
+        with mock.patch.object(search, "STRONG_MATCH_THRESHOLD", exact):
+            results = search.rank_places("blu bottl", SAMPLE_PLACES)
+        self.assertFalse(results.is_weak)
+        self.assertIn(BLUE_BOTTLE, [result.place for result in results])
+
+        with mock.patch.object(search, "STRONG_MATCH_THRESHOLD", exact + 0.01):
+            just_missed = search.rank_places("blu bottl", SAMPLE_PLACES)
+        self.assertTrue(just_missed.is_weak)
+
+
+class SearchFallbackTests(unittest.TestCase):
+    """No strong match: guess, and say that it is a guess."""
+
+    def test_a_query_matching_nothing_returns_exactly_three_weak_results(self):
+        results = search.rank_places("zzzzqqq", SAMPLE_PLACES)
+
+        self.assertEqual(len(results), search.WEAK_MATCH_LIMIT)
+        self.assertTrue(results.is_weak)
+        self.assertTrue(all(result.is_weak for result in results))
+
+    def test_the_fallback_fires_even_when_every_score_is_zero(self):
+        results = search.rank_places("zzzzqqq", SAMPLE_PLACES)
+
+        self.assertEqual([result.score for result in results], [0, 0, 0])
+        self.assertTrue(results.is_weak)
+
+    def test_the_fallback_never_returns_more_than_the_weak_limit(self):
+        many = [place("Place " + letter) for letter in "abcdefgh"]
+
+        results = search.rank_places("zzzzqqq", many)
+
+        self.assertEqual(len(results), search.WEAK_MATCH_LIMIT)
+
+    def test_two_candidates_give_two_weak_results_and_one_gives_one(self):
+        """Closest 3 is a ceiling, never a quota -- nothing is padded."""
+        two = search.rank_places("zzzzqqq", [BLUE_BOTTLE, RAMEN_SHOP])
+        one = search.rank_places("zzzzqqq", [BLUE_BOTTLE])
+
+        self.assertEqual(len(two), 2)
+        self.assertEqual(len(one), 1)
+        self.assertTrue(two.is_weak)
+        self.assertTrue(one.is_weak)
+        self.assertEqual([result.place for result in one], [BLUE_BOTTLE])
+
+    def test_no_candidates_at_all_returns_an_empty_set_and_no_fallback(self):
+        for query in ("zzzzqqq", "blue bottle", ""):
+            results = search.rank_places(query, [])
+
+            self.assertEqual(len(results), 0)
+            self.assertFalse(results.is_weak)
+
+    def test_a_result_set_is_all_strong_or_all_weak_and_never_mixed(self):
+        for query in ("blue bottle", "cofee", "zzzzqqq", "ramn"):
+            results = search.rank_places(query, SAMPLE_PLACES)
+            flags = {result.is_weak for result in results}
+
+            self.assertEqual(flags, {results.is_weak})
+
+    def test_the_weak_flag_is_readable_without_comparing_scores(self):
+        """How issue #6 decides whether to print its header: read the flag,
+        do not import the threshold and do not recompute anything."""
+        weak = search.rank_places("zzzzqqq", SAMPLE_PLACES)
+        strong = search.rank_places("blue bottle", SAMPLE_PLACES)
+
+        self.assertIs(weak.is_weak, True)
+        self.assertIs(strong.is_weak, False)
+
+
+class SearchEmptyAndDegenerateInputTests(unittest.TestCase):
+    """The inputs that break tools: empty everything, None, punctuation."""
+
+    def test_an_empty_query_returns_nothing_and_does_not_fall_back(self):
+        results = search.rank_places("", SAMPLE_PLACES)
+
+        self.assertEqual(len(results), 0)
+        self.assertFalse(results.is_weak)
+
+    def test_a_whitespace_only_query_returns_nothing_and_does_not_fall_back(self):
+        results = search.rank_places("   \t ", SAMPLE_PLACES)
+
+        self.assertEqual(len(results), 0)
+        self.assertFalse(results.is_weak)
+
+    def test_a_place_with_only_a_name_is_scored_on_that_name_alone(self):
+        bare = place("Blue Bottle", note="", neighborhood="", tags=())
+
+        results = search.rank_places("blue bottle", [bare])
+
+        self.assertFalse(results.is_weak)
+        self.assertGreaterEqual(results[0].score, search.STRONG_MATCH_THRESHOLD)
+
+    def test_empty_fields_never_match_an_empty_string_into_a_high_score(self):
+        bare = place("", note="", neighborhood="", tags=())
+
+        results = search.rank_places("blue bottle", [bare])
+
+        self.assertEqual(results[0].score, 0)
+        self.assertTrue(results.is_weak)
+
+    def test_a_none_note_or_neighborhood_is_treated_like_an_empty_string(self):
+        nones = place("Blue Bottle", note=None, neighborhood=None, tags=())
+        empties = place("Blue Bottle", note="", neighborhood="", tags=())
+
+        self.assertEqual(
+            search.rank_places("blue bottle", [nones])[0].score,
+            search.rank_places("blue bottle", [empties])[0].score,
+        )
+
+    def test_a_candidate_with_an_empty_name_does_not_crash_the_module(self):
+        nameless = place("", note="good wifi", neighborhood="Mitte", tags=["coffee"])
+
+        results = search.rank_places("coffee", [nameless])
+
+        self.assertEqual(len(results), 1)
+
+    def test_a_candidate_missing_the_attributes_entirely_is_tolerated(self):
+        results = search.rank_places(
+            "blue bottle", [SimpleNamespace(name="Blue Bottle")]
+        )
+
+        self.assertFalse(results.is_weak)
+
+
+class SearchDeterminismTests(unittest.TestCase):
+    """Same data in, same order out -- every run, whatever the input order."""
+
+    def test_the_same_call_twice_returns_equal_results(self):
+        first = search.rank_places("coffee wifi", SAMPLE_PLACES)
+        second = search.rank_places("coffee wifi", SAMPLE_PLACES)
+
+        self.assertEqual(first, second)
+        self.assertEqual(
+            [(result.place, result.score, result.is_weak) for result in first],
+            [(result.place, result.score, result.is_weak) for result in second],
+        )
+
+    def test_shuffling_the_input_does_not_change_the_output_order(self):
+        """Fixed permutations, not random ones: a test that shuffles by luck
+        cannot say which ordering it proved."""
+        baseline = [result.place for result in search.rank_places("zzzzqqq", SAMPLE_PLACES)]
+
+        for order in (
+            [TIERGARTEN, RAMEN_SHOP, BLUE_BOTTLE],
+            [RAMEN_SHOP, BLUE_BOTTLE, TIERGARTEN],
+            [TIERGARTEN, BLUE_BOTTLE, RAMEN_SHOP],
+        ):
+            shuffled = [result.place for result in search.rank_places("zzzzqqq", order)]
+
+            self.assertEqual(shuffled, baseline)
+
+    def test_ties_are_broken_by_lowercased_name_ascending(self):
+        zulu = place("zulu bar", tags=["coffee"])
+        alpha = place("Alpha Bar", tags=["coffee"])
+        mike = place("mike bar", tags=["coffee"])
+
+        results = search.rank_places("coffee", [zulu, mike, alpha])
+
+        self.assertEqual(len({result.score for result in results}), 1)
+        self.assertEqual(
+            [result.place.name for result in results],
+            ["Alpha Bar", "mike bar", "zulu bar"],
+        )
+
+    def test_the_tie_break_also_decides_which_three_the_fallback_picks(self):
+        candidates = [
+            place("echo"),
+            place("Alpha"),
+            place("delta"),
+            place("Bravo"),
+            place("charlie"),
+        ]
+
+        results = search.rank_places("zzzzqqq", candidates)
+
+        self.assertEqual(
+            [result.place.name for result in results], ["Alpha", "Bravo", "charlie"]
+        )
