@@ -8,15 +8,27 @@ again before closing one.
 - **Tasks are GitHub issues, one at a time.** The backlog in
   [tasks.md](tasks.md) is mirrored as issues #1–#10 in
   `elugardo/ai-dev-tools-zoomcamp`. Pick one, finish it, then pick the next.
-- **Read the Goal before starting and before closing.** The Goal line is the
-  acceptance criterion. If what you built does not satisfy it literally, the task
-  is not done.
+- **Groom before implementing.** Every task is groomed by the PM first, which
+  rewrites the issue into the four sections of [task-template.md](task-template.md).
+  A raw two-sentence backlog entry is not ready to build from.
+- **Read the acceptance criteria before starting and before closing.** On a
+  groomed issue they are the definition of done — tick every box, literally. On
+  an ungroomed one the Goal line stands in until the PM has been through it.
 - **Work on a branch** named for the issue: `1-project-skeleton`,
   `5-fuzzy-ranking`. Never commit feature work directly to `main`.
 - **Commit regularly** — at each point the tests pass, not once at the end.
   Reference the issue in the commit body (`Refs #5`), and use `Closes #5` on the
   commit or PR that finishes it.
 - **Leave the suite green.** `manage.py test` must pass before any commit.
+
+## Roles
+
+Role definitions live in [`team/`](team/). Adopt one only when asked for it by
+name.
+
+- **PM** — grooms a task before anyone implements it, follows
+  [`team/pm.md`](team/pm.md). Decides what "done" means, names the edge cases,
+  and writes no code.
 
 ## Order and dependencies
 
