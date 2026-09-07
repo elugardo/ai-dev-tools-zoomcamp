@@ -1,9 +1,10 @@
 import ast
 import inspect
+import random
 import unittest
 import warnings
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from types import SimpleNamespace
 from unittest import mock
@@ -4090,3 +4091,834 @@ class WishlistLoopIntegrationTests(TodoCommandTestCase):
         out, err = self.run_todo()
 
         self.assertIn(_todo_module().WISHLIST_CLEARED_MESSAGE, out)
+
+
+# ---------------------------------------------------------------------------
+# `surprise` (issue #8)
+#
+# The weighting is checked statistically in *shape* only: every draw below is
+# `call_command("surprise", seed=<fixed int>)`, so the tallies are identical
+# on every machine and every run. That is what `_docs/testing-guidelines.md`
+# means by "pin randomness" -- not running the command repeatedly and hoping.
+# ---------------------------------------------------------------------------
+
+
+#: How many fixed seeds a distribution test loops through. Issue #8 names
+#: 1000, and the bounds below are written as fractions of this constant.
+DRAWS = 1000
+
+#: Fixture A, in the order it is created, so primary keys run 1..5.
+#:
+#: =============== ========= ================ ======
+#: Place           status    last_visited_at  weight
+#: =============== ========= ================ ======
+#: Wishlist Bar    wishlist  None                 10
+#: Ghost Diner     visited   None                  5
+#: Old Ramen       visited   200 days ago          5
+#: Mid Park        visited   90 days ago           3
+#: Yesterday Cafe  visited   1 day ago             1
+#: =============== ========= ================ ======
+FIXTURE_A_NAMES = [
+    "Wishlist Bar",
+    "Ghost Diner",
+    "Old Ramen",
+    "Mid Park",
+    "Yesterday Cafe",
+]
+
+
+def _surprise_module():
+    """The ``surprise`` command module, imported the way Django finds it."""
+    from places.management.commands import surprise as surprise_module
+
+    return surprise_module
+
+
+def _make_place(name, tags=(), days_ago=None, **fields):
+    """A place, with its tags attached and its visit date placed in the past."""
+    place = Place.objects.create(name=name, **fields)
+    for tag_name in tags:
+        place.tags.add(Tag.objects.get_or_create(name=tag_name)[0])
+    if days_ago is not None:
+        place.last_visited_at = django_timezone.now() - timedelta(days=days_ago)
+        place.save(update_fields=["last_visited_at"])
+    return place
+
+
+def _create_fixture_a():
+    """Create Fixture A. Insertion order fixes the primary keys, and with them
+    the candidate order every seeded assertion below depends on."""
+    visited = Place.Status.VISITED
+    _make_place("Wishlist Bar")
+    _make_place("Ghost Diner", status=visited)
+    _make_place("Old Ramen", status=visited, days_ago=200)
+    _make_place("Mid Park", status=visited, days_ago=90)
+    _make_place("Yesterday Cafe", status=visited, days_ago=1)
+    return list(FIXTURE_A_NAMES)
+
+
+class SurpriseCommandDiscoveryTests(SimpleTestCase):
+    """The command is discoverable and takes the documented flags."""
+
+    def parser(self):
+        return load_command_class("places", "surprise").create_parser(
+            "manage.py", "surprise"
+        )
+
+    def test_surprise_is_registered_as_a_command_of_the_places_app(self):
+        self.assertEqual(get_commands().get("surprise"), "places")
+
+    def test_help_documents_both_filters_and_the_seed(self):
+        help_text = self.parser().format_help()
+
+        for flag in ("--tag", "--neighborhood", "--seed"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+    def test_surprise_takes_no_positional_argument(self):
+        parsed = self.parser().parse_args([])
+
+        self.assertEqual((parsed.tag, parsed.neighborhood, parsed.seed), (None,) * 3)
+
+    def test_the_seed_is_parsed_as_a_whole_number(self):
+        self.assertEqual(self.parser().parse_args(["--seed", "7"]).seed, 7)
+
+    def test_the_out_of_scope_flags_are_absent(self):
+        """Issue #8 rules each of these out by name."""
+        help_text = self.parser().format_help()
+
+        for flag in ("--limit", "--status", "--visit", "--accept"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, help_text)
+
+
+class SurpriseCommandSourceRuleTests(SimpleTestCase):
+    """Rules issue #8 states which are cheaper to read off the source."""
+
+    def test_surprise_does_not_hand_roll_tag_normalization(self):
+        source = inspect.getsource(_surprise_module())
+
+        self.assertIn("normalize_tag_name", source)
+        self.assertNotIn(".lower()", source)
+
+    def test_surprise_draws_from_a_private_generator_not_the_global_one(self):
+        calls = _dotted_calls(_surprise_module())
+
+        self.assertIn("random.Random", calls)
+        self.assertNotIn("random.seed", calls)
+        self.assertNotIn("random.choices", calls)
+        self.assertNotIn("random.choice", calls)
+
+    def test_surprise_orders_its_candidates_by_primary_key(self):
+        self.assertIn('order_by("pk")', inspect.getsource(_surprise_module()))
+
+    def test_surprise_prefetches_the_tags_it_prints(self):
+        self.assertIn('prefetch_related("tags")', inspect.getsource(_surprise_module()))
+
+    def test_surprise_reads_the_clock_through_django(self):
+        calls = _dotted_calls(_surprise_module())
+
+        self.assertIn("timezone.now", calls)
+        self.assertNotIn("datetime.now", calls)
+
+    def test_surprise_pulls_in_nothing_from_the_fuzzy_ranker(self):
+        imported = _imported_modules(_surprise_module())
+
+        self.assertNotIn("places.search", imported)
+        self.assertNotIn("rapidfuzz", imported)
+
+    def test_surprise_never_writes(self):
+        """It suggests; ``visit`` records. No writing call may exist at all."""
+        called = _called_names(_surprise_module())
+
+        for writer in ("save", "update", "create", "get_or_create", "delete"):
+            with self.subTest(writer=writer):
+                self.assertNotIn(writer, called)
+
+
+class SurpriseCommandTestCase(TestCase):
+    """Shared plumbing: run ``surprise`` through ``call_command``."""
+
+    def make_place(self, *args, **kwargs):
+        return _make_place(*args, **kwargs)
+
+    def fixture_a(self):
+        return _create_fixture_a()
+
+    def run_surprise(self, *args, **options):
+        out, err = StringIO(), StringIO()
+        call_command("surprise", *args, stdout=out, stderr=err, **options)
+        return out.getvalue(), err.getvalue()
+
+    def picked(self, out, names):
+        """The one name from ``names`` that ``out`` names, asserting it is one."""
+        found = [name for name in names if name in out]
+        self.assertEqual(len(found), 1, f"expected exactly one place, got {found}")
+        return found[0]
+
+    def tally(self, names, *args, draws=DRAWS, **options):
+        """Which place each of ``draws`` fixed seeds picks, counted.
+
+        Every seed is a literal, so this is deterministic to the draw: the
+        same numbers come back on every machine and on every run.
+        """
+        counts = dict.fromkeys(names, 0)
+        for seed in range(draws):
+            out, _ = self.run_surprise(*args, seed=seed, **options)
+            counts[self.picked(out, names)] += 1
+        return counts
+
+
+class SurpriseWeightLadderTests(SimpleTestCase):
+    """The ladder itself, on unsaved instances -- no database needed.
+
+    The tiers are pinned here because the boundaries are exact and no
+    distribution can tell thirty-days-exactly from thirty-days-and-a-second.
+    The distribution tests below are what prove the ladder is actually used.
+    """
+
+    def setUp(self):
+        self.surprise = _surprise_module()
+        self.now = django_timezone.now()
+
+    def weight(self, status, last_visited_at):
+        place = Place(name="x", status=status, last_visited_at=last_visited_at)
+        return self.surprise.weight_for(place, self.now)
+
+    def visited(self, **age):
+        return self.weight(Place.Status.VISITED, self.now - timedelta(**age))
+
+    def test_a_wishlist_place_weighs_ten(self):
+        self.assertEqual(self.weight(Place.Status.WISHLIST, None), 10)
+
+    def test_a_wishlist_place_weighs_ten_even_when_a_visit_date_is_stamped(self):
+        """Status is the authority on "have I been here", not the timestamp."""
+        stamped = self.weight(Place.Status.WISHLIST, self.now - timedelta(days=1))
+
+        self.assertEqual(stamped, 10)
+
+    def test_a_visited_place_with_no_date_weighs_five_not_ten(self):
+        """The decision issue #8 records: date unknown means "ages ago"."""
+        weight = self.weight(Place.Status.VISITED, None)
+
+        self.assertEqual(weight, 5)
+
+    def test_a_visited_place_with_no_date_weighs_the_same_as_a_long_ago_visit(self):
+        self.assertEqual(self.weight(Place.Status.VISITED, None), self.visited(days=200))
+
+    def test_a_visit_long_ago_weighs_five(self):
+        self.assertEqual(self.visited(days=200), 5)
+
+    def test_a_visit_exactly_one_hundred_and_eighty_days_ago_weighs_five(self):
+        self.assertEqual(self.visited(days=180), 5)
+
+    def test_a_visit_just_under_one_hundred_and_eighty_days_ago_weighs_three(self):
+        self.assertEqual(self.visited(days=179, hours=23), 3)
+
+    def test_a_middling_visit_weighs_three(self):
+        self.assertEqual(self.visited(days=90), 3)
+
+    def test_a_visit_exactly_thirty_days_ago_weighs_three_not_one(self):
+        self.assertEqual(self.visited(days=30), 3)
+
+    def test_a_visit_just_under_thirty_days_ago_weighs_one(self):
+        self.assertEqual(self.visited(days=29, hours=23), 1)
+
+    def test_a_recent_visit_weighs_one(self):
+        self.assertEqual(self.visited(days=1), 1)
+
+    def test_a_visit_stamped_this_instant_weighs_one(self):
+        self.assertEqual(self.visited(days=0), 1)
+
+    def test_a_visit_dated_in_the_future_weighs_one_and_never_goes_negative(self):
+        """Clock skew, or a typo in the admin. Never an error, never negative."""
+        weight = self.weight(Place.Status.VISITED, self.now + timedelta(days=400))
+
+        self.assertEqual(weight, 1)
+
+    def test_no_rung_of_the_ladder_is_zero(self):
+        surprise = self.surprise
+        rungs = (
+            surprise.WISHLIST_WEIGHT,
+            surprise.LONG_AGO_WEIGHT,
+            surprise.MIDDLING_WEIGHT,
+            surprise.RECENT_WEIGHT,
+        )
+
+        for rung in rungs:
+            with self.subTest(rung=rung):
+                self.assertGreater(rung, 0)
+
+    def test_the_ladder_descends(self):
+        surprise = self.surprise
+
+        self.assertGreater(surprise.WISHLIST_WEIGHT, surprise.LONG_AGO_WEIGHT)
+        self.assertGreater(surprise.LONG_AGO_WEIGHT, surprise.MIDDLING_WEIGHT)
+        self.assertGreater(surprise.MIDDLING_WEIGHT, surprise.RECENT_WEIGHT)
+
+
+class SurpriseDistributionTests(SurpriseCommandTestCase):
+    """A thousand fixed seeds against Fixture A, tallied.
+
+    Statistical in shape, deterministic in fact. The tally is computed once
+    for the class -- ``setUpTestData`` gives every method the same rows, so
+    running the thousand draws per method would only buy the same numbers
+    seven times over.
+    """
+
+    _counts = None
+
+    @classmethod
+    def setUpTestData(cls):
+        _create_fixture_a()
+
+    def setUp(self):
+        self.names = list(FIXTURE_A_NAMES)
+        if type(self)._counts is None:
+            type(self)._counts = self.tally(self.names)
+        self.counts = type(self)._counts
+
+    def test_every_place_is_reachable(self):
+        for name in self.names:
+            with self.subTest(name=name):
+                self.assertGreater(self.counts[name], 0)
+
+    def test_the_pick_is_not_always_the_same_place(self):
+        chosen = [name for name, count in self.counts.items() if count]
+
+        self.assertGreaterEqual(len(chosen), 2)
+
+    def test_the_tally_is_ordered_by_the_ladder(self):
+        counts = self.counts
+
+        self.assertGreater(counts["Wishlist Bar"], counts["Ghost Diner"])
+        self.assertGreater(counts["Wishlist Bar"], counts["Old Ramen"])
+        self.assertGreater(counts["Ghost Diner"], counts["Mid Park"])
+        self.assertGreater(counts["Old Ramen"], counts["Mid Park"])
+        self.assertGreater(counts["Mid Park"], counts["Yesterday Cafe"])
+
+    def test_a_wishlist_place_outranks_a_recently_visited_one_by_a_lot(self):
+        """Expected under the ladder: roughly 417 and 42 out of 1000."""
+        wishlist = self.counts["Wishlist Bar"]
+        yesterday = self.counts["Yesterday Cafe"]
+
+        self.assertGreater(wishlist, 0.30 * DRAWS)
+        self.assertLess(yesterday, 0.12 * DRAWS)
+        self.assertGreaterEqual(wishlist, 3 * yesterday)
+
+    def test_the_equal_weight_pair_lands_within_a_tenth_of_each_other(self):
+        """``Ghost Diner`` (date unknown) and ``Old Ramen`` (200 days) both weigh 5."""
+        gap = abs(self.counts["Ghost Diner"] - self.counts["Old Ramen"])
+
+        self.assertLessEqual(gap, 0.10 * DRAWS)
+
+    def test_a_visited_place_with_no_date_is_drawn_far_less_than_a_wishlist_one(self):
+        """The other half of the null-date decision: weight 5, never promoted to 10."""
+        ghost = self.counts["Ghost Diner"]
+        wishlist = self.counts["Wishlist Bar"]
+
+        self.assertLess(ghost, 0.75 * wishlist)
+
+    def test_a_visited_place_with_no_date_is_drawn_far_more_than_a_recent_one(self):
+        """And never demoted to the bottom rung either."""
+        ghost = self.counts["Ghost Diner"]
+        yesterday = self.counts["Yesterday Cafe"]
+
+        self.assertGreater(ghost, 2 * yesterday)
+
+    def test_the_tally_adds_up_to_the_number_of_draws(self):
+        self.assertEqual(sum(self.counts.values()), DRAWS)
+
+
+class SurpriseUniformityTests(SurpriseCommandTestCase):
+    """Equal weights draw equally often."""
+
+    def test_two_wishlist_places_split_a_thousand_draws_evenly(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Tartine")
+
+        counts = self.tally(["Blue Bottle", "Tartine"])
+
+        for name, count in counts.items():
+            with self.subTest(name=name):
+                self.assertGreater(count, 0.40 * DRAWS)
+                self.assertLess(count, 0.60 * DRAWS)
+
+
+class SurpriseSeedTests(SurpriseCommandTestCase):
+    """``--seed`` reproduces a pick without disturbing anything else."""
+
+    #: The golden pin: recorded once during implementation against Fixture A,
+    #: and never moved. It guards "the draw is reproducible"; the distribution
+    #: tests above are what actually prove the ladder.
+    GOLDEN_SEED = 42
+    GOLDEN_PICK = "Old Ramen"
+
+    def test_the_same_seed_picks_the_same_place_twice(self):
+        self.fixture_a()
+
+        first, _ = self.run_surprise(seed=1234)
+        second, _ = self.run_surprise(seed=1234)
+
+        self.assertEqual(first, second)
+
+    def test_the_golden_seed_picks_the_place_it_has_always_picked(self):
+        names = self.fixture_a()
+
+        out, _ = self.run_surprise(seed=self.GOLDEN_SEED)
+
+        self.assertEqual(self.picked(out, names), self.GOLDEN_PICK)
+
+    def test_the_seed_is_reachable_as_a_keyword_and_as_a_flag(self):
+        names = self.fixture_a()
+
+        as_keyword, _ = self.run_surprise(seed=self.GOLDEN_SEED)
+        as_flag, _ = self.run_surprise("--seed", str(self.GOLDEN_SEED))
+
+        self.assertEqual(self.picked(as_flag, names), self.GOLDEN_PICK)
+        self.assertEqual(as_flag, as_keyword)
+
+    def test_different_seeds_reach_different_places(self):
+        names = self.fixture_a()
+
+        picks = {
+            self.picked(self.run_surprise(seed=seed)[0], names) for seed in range(40)
+        }
+
+        self.assertGreater(len(picks), 1)
+
+    def test_an_unseeded_run_is_genuinely_unseeded(self):
+        """Forty unseeded draws over Fixture A.
+
+        The likeliest place carries 5/12 of the weight, so all forty agreeing
+        has a probability under 1e-15 -- this is not a coin flip dressed up as
+        a test.
+        """
+        names = self.fixture_a()
+
+        picks = {self.picked(self.run_surprise()[0], names) for _ in range(40)}
+
+        self.assertGreater(len(picks), 1)
+
+    def test_seeding_leaves_the_process_wide_random_state_untouched(self):
+        """A command calling ``random.seed()`` would pin the rest of the suite."""
+        self.fixture_a()
+        before = random.getstate()
+
+        self.run_surprise(seed=1)
+
+        self.assertEqual(random.getstate(), before)
+
+    def test_an_unseeded_run_leaves_the_process_wide_random_state_untouched(self):
+        self.fixture_a()
+        before = random.getstate()
+
+        self.run_surprise()
+
+        self.assertEqual(random.getstate(), before)
+
+    def test_the_global_generator_yields_the_same_sequence_across_a_run(self):
+        """The observable consequence of the state check above."""
+        self.fixture_a()
+        random.seed(99)
+        expected = [random.random() for _ in range(3)]
+
+        random.seed(99)
+        first = random.random()
+        self.run_surprise(seed=5)
+        rest = [random.random() for _ in range(2)]
+
+        self.assertEqual([first] + rest, expected)
+
+    def test_the_draw_follows_primary_key_order_not_name_order(self):
+        """Without a fixed candidate order every seeded assertion is flaky.
+
+        Two equally weighted places whose insertion order is the reverse of
+        their alphabetical order, and a seed that draws the *first* candidate.
+        Which name comes back therefore says which order the command used --
+        and ``Place.Meta.ordering`` is by name, so name order is exactly what
+        would silently take over if the ``order_by("pk")`` were dropped.
+        """
+        self.make_place("Zebra Lounge")
+        self.make_place("Alpha Bar")
+
+        out, _ = self.run_surprise(seed=1)
+
+        self.assertEqual(self.picked(out, ["Zebra Lounge", "Alpha Bar"]), "Zebra Lounge")
+
+
+class SurpriseFilterTests(SurpriseCommandTestCase):
+    """``--tag`` and ``--neighborhood``, ANDed, applied before the weighting."""
+
+    def setUp(self):
+        self.make_place("Blue Bottle", tags=["coffee"], neighborhood="Mission")
+        self.make_place("Ramen Shop", tags=["ramen"], neighborhood="Mission")
+        self.make_place("Sightglass", tags=["coffee"], neighborhood="SoMa")
+
+    def test_a_tag_narrows_the_pool_to_places_carrying_it(self):
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                out, _ = self.run_surprise("--tag", "coffee", seed=seed)
+
+                self.assertNotIn("Ramen Shop", out)
+
+    def test_a_tag_can_narrow_the_pool_to_one_place(self):
+        out, _ = self.run_surprise("--tag", "ramen", seed=3)
+
+        self.assertIn("Ramen Shop", out)
+
+    def test_the_tag_lookup_ignores_the_case_and_padding_of_the_flag(self):
+        baseline, _ = self.run_surprise("--tag", "coffee", seed=0)
+
+        for typed in ("Coffee", "COFFEE", "  CoFfEe  "):
+            with self.subTest(typed=typed):
+                out, _ = self.run_surprise("--tag", typed, seed=0)
+
+                self.assertEqual(out, baseline)
+                self.assertNotIn("Ramen Shop", out)
+
+    def test_a_mixed_case_tag_reaches_the_same_single_place(self):
+        lower, _ = self.run_surprise("--tag", "ramen", seed=3)
+        upper, _ = self.run_surprise("--tag", "RAMEN", seed=3)
+
+        self.assertIn("Ramen Shop", upper)
+        self.assertEqual(lower, upper)
+
+    def test_a_neighborhood_narrows_the_pool_to_places_in_it(self):
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                out, _ = self.run_surprise("--neighborhood", "SoMa", seed=seed)
+
+                self.assertIn("Sightglass", out)
+
+    def test_the_neighborhood_lookup_ignores_case(self):
+        for typed in ("SoMa", "soma", "SOMA"):
+            with self.subTest(typed=typed):
+                out, _ = self.run_surprise("--neighborhood", typed, seed=0)
+
+                self.assertIn("Sightglass", out)
+
+    def test_the_neighborhood_matches_the_whole_value_not_a_substring(self):
+        """Partial matching is deliberately ``find``'s job, not this one's."""
+        with self.assertRaises(CommandError):
+            self.run_surprise("--neighborhood", "Mis", seed=0)
+
+    def test_the_two_filters_combine_with_and(self):
+        for seed in range(12):
+            with self.subTest(seed=seed):
+                out, _ = self.run_surprise(
+                    "--tag", "coffee", "--neighborhood", "Mission", seed=seed
+                )
+
+                self.assertIn("Blue Bottle", out)
+                self.assertNotIn("Sightglass", out)
+                self.assertNotIn("Ramen Shop", out)
+
+    def test_the_two_filters_can_exclude_each_other(self):
+        with self.assertRaises(CommandError):
+            self.run_surprise("--tag", "ramen", "--neighborhood", "SoMa", seed=0)
+
+    def test_filtering_re_normalizes_the_odds_rather_than_wasting_draws(self):
+        """Weights are computed over the survivors only.
+
+        Both coffee places are wishlist entries, so with the ramen place
+        excluded they split the draws evenly. If the excluded place still held
+        a share of the total, some seeds would land on nobody.
+        """
+        counts = self.tally(["Blue Bottle", "Sightglass"], "--tag", "coffee", draws=200)
+
+        self.assertEqual(sum(counts.values()), 200)
+        for name, count in counts.items():
+            with self.subTest(name=name):
+                self.assertGreater(count, 0.40 * 200)
+
+
+class SurpriseEmptyCaseTests(SurpriseCommandTestCase):
+    """Nothing to suggest, told two different ways, both of them non-zero."""
+
+    def message_of(self, *args, **options):
+        with self.assertRaises(CommandError) as raised:
+            self.run_surprise(*args, **options)
+        return str(raised.exception)
+
+    def test_an_empty_journal_is_an_error_naming_the_situation(self):
+        message = self.message_of()
+
+        self.assertEqual(Place.objects.count(), 0)
+        self.assertIn("no places in the journal", message)
+        self.assertIn("add", message)
+
+    def test_an_empty_journal_prints_nothing_to_stdout(self):
+        """Not even a blank line."""
+        out = StringIO()
+
+        with self.assertRaises(CommandError):
+            call_command("surprise", stdout=out)
+
+        self.assertEqual(out.getvalue(), "")
+
+    def test_filters_that_match_nothing_read_differently_from_an_empty_journal(self):
+        empty = self.message_of()
+        self.make_place("Blue Bottle", tags=["coffee"])
+
+        narrow = self.message_of("--tag", "ramen")
+
+        self.assertIn("Nothing matches those filters", narrow)
+        self.assertNotIn("Nothing matches those filters", empty)
+        self.assertNotIn("no places in the journal", narrow)
+
+    def test_the_filter_message_echoes_back_the_filters_that_were_applied(self):
+        self.make_place("Blue Bottle", tags=["coffee"], neighborhood="Mission")
+
+        message = self.message_of("--tag", "Ramen", "--neighborhood", "SoMa")
+
+        self.assertIn("--tag ramen", message)
+        self.assertIn("--neighborhood SoMa", message)
+
+    def test_the_filter_message_names_only_the_filter_that_was_given(self):
+        self.make_place("Blue Bottle", tags=["coffee"], neighborhood="Mission")
+
+        message = self.message_of("--tag", "ramen")
+
+        self.assertIn("--tag ramen", message)
+        self.assertNotIn("--neighborhood ", message.split("Try dropping")[0])
+
+    def test_a_tag_that_matches_no_tag_row_at_all_takes_the_filter_message(self):
+        """Not a crash, and not the empty-journal message."""
+        self.make_place("Blue Bottle", tags=["coffee"])
+
+        message = self.message_of("--tag", "nonexistent")
+
+        self.assertIn("Nothing matches those filters", message)
+        self.assertIn("--tag nonexistent", message)
+
+    def test_the_two_no_candidate_messages_share_no_distinctive_phrase(self):
+        surprise = _surprise_module()
+
+        self.assertNotIn(
+            "Nothing matches those filters", surprise.EMPTY_JOURNAL_MESSAGE
+        )
+        self.assertNotIn("no places in the journal", surprise.NO_CANDIDATES_MESSAGE)
+
+    def test_one_candidate_is_always_the_pick_however_low_its_weight(self):
+        """The bottom rung of the ladder, alone: still picked, on every seed."""
+        self.make_place("Yesterday Cafe", status=Place.Status.VISITED, days_ago=1)
+
+        for seed in range(25):
+            with self.subTest(seed=seed):
+                out, _ = self.run_surprise(seed=seed)
+
+                self.assertIn("Yesterday Cafe", out)
+
+    def test_one_surviving_candidate_is_the_pick_on_every_seed(self):
+        self.make_place("Blue Bottle", tags=["coffee"])
+        self.make_place("Ramen Shop", tags=["ramen"])
+
+        for seed in range(15):
+            with self.subTest(seed=seed):
+                out, _ = self.run_surprise("--tag", "ramen", seed=seed)
+
+                self.assertIn("Ramen Shop", out)
+                self.assertNotIn("Blue Bottle", out)
+
+
+class SurpriseOutputTests(SurpriseCommandTestCase):
+    """One place, its reason, and its note in full."""
+
+    def only_place(self, **fields):
+        """Create the single place in the journal, then run and return the output."""
+        place = _make_place(fields.pop("name", "Blue Bottle"), **fields)
+        out, err = self.run_surprise(seed=0)
+        return place, out, err
+
+    def test_the_output_names_the_place(self):
+        _, out, _ = self.only_place()
+
+        self.assertIn("Blue Bottle", out)
+
+    def test_the_output_carries_neighborhood_status_and_rating(self):
+        _, out, _ = self.only_place(
+            neighborhood="Mission", status=Place.Status.VISITED, rating=4
+        )
+
+        self.assertIn("Mission", out)
+        self.assertIn("visited", out)
+        self.assertIn("rating 4", out)
+
+    def test_the_output_names_the_places_tags(self):
+        _, out, _ = self.only_place(tags=["coffee", "wifi"])
+
+        self.assertIn("coffee", out)
+        self.assertIn("wifi", out)
+
+    def test_the_note_is_printed_in_full_and_is_never_snipped(self):
+        """Unlike ``find`` and ``todo``, which cut a note to keep a list tidy."""
+        note = (
+            "the corner table by the window has the only power outlet in the "
+            "building, and the cortado is worth the queue on a Saturday "
+            "morning even when it wraps around the block"
+        )
+
+        _, out, _ = self.only_place(note=note)
+
+        self.assertGreater(len(note), _lookup_module().NOTE_SNIPPET_LENGTH)
+        self.assertIn(note, out)
+        self.assertNotIn(_lookup_module().TRUNCATION_MARKER, out)
+
+    def test_the_note_is_printed_once_not_twice(self):
+        note = "great cortado and quiet upstairs"
+
+        _, out, _ = self.only_place(note=note)
+
+        self.assertEqual(out.count(note), 1)
+
+    def test_a_multi_line_note_survives_intact(self):
+        note = "great cortado\nand the upstairs room is always empty"
+
+        _, out, _ = self.only_place(note=note)
+
+        self.assertIn(note, out)
+
+    def test_a_wishlist_place_says_it_has_never_been_visited(self):
+        _, out, _ = self.only_place()
+
+        self.assertIn("never visited", out)
+
+    def test_a_visited_place_with_no_date_says_the_date_is_unknown(self):
+        _, out, _ = self.only_place(status=Place.Status.VISITED)
+
+        self.assertIn("visited, date unknown", out)
+        self.assertNotIn("never visited", out)
+
+    def test_a_visited_place_with_a_date_shows_that_date(self):
+        place, out, _ = self.only_place(status=Place.Status.VISITED, days_ago=200)
+
+        self.assertIn(place.last_visited_at.strftime("%Y-%m-%d"), out)
+        self.assertNotIn("never visited", out)
+        self.assertNotIn("date unknown", out)
+
+    def test_the_three_reasons_are_three_different_strings(self):
+        reasons = set()
+        for fields in (
+            {"name": "Wishlist Bar"},
+            {"name": "Ghost Diner", "status": Place.Status.VISITED},
+            {"name": "Old Ramen", "status": Place.Status.VISITED, "days_ago": 200},
+        ):
+            Place.objects.all().delete()
+            _, out, _ = self.only_place(**fields)
+            reasons.add(out.split("Why:")[1].splitlines()[0].strip())
+
+        self.assertEqual(len(reasons), 3)
+
+    def test_a_bare_place_prints_no_none_no_null_and_no_empty_note_field(self):
+        """No rating, no note, no neighborhood, no tags, no visit date."""
+        _, out, _ = self.only_place()
+
+        self.assertNotIn("None", out)
+        self.assertNotIn("null", out)
+        self.assertNotIn("Note:", out)
+
+    def test_a_visited_place_with_nothing_filled_in_prints_no_none(self):
+        _, out, _ = self.only_place(status=Place.Status.VISITED)
+
+        self.assertNotIn("None", out)
+        self.assertNotIn("null", out)
+
+    def test_the_output_is_not_blank(self):
+        _, out, _ = self.only_place()
+
+        self.assertTrue(out.strip())
+
+    def test_exactly_one_place_is_named(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Tartine")
+        self.make_place("Sightglass")
+
+        for seed in range(20):
+            with self.subTest(seed=seed):
+                out, _ = self.run_surprise(seed=seed)
+                named = [
+                    name
+                    for name in ("Blue Bottle", "Tartine", "Sightglass")
+                    if name in out
+                ]
+
+                self.assertEqual(len(named), 1)
+
+    def test_a_successful_run_writes_nothing_to_stderr(self):
+        _, _, err = self.only_place()
+
+        self.assertEqual(err, "")
+
+
+class SurpriseReadOnlyTests(SurpriseCommandTestCase):
+    """``surprise`` suggests; it never records. Stamping belongs to ``visit``."""
+
+    def snapshot(self):
+        return (
+            list(Place.objects.order_by("pk").values()),
+            list(Tag.objects.order_by("pk").values()),
+            list(Place.tags.through.objects.order_by("pk").values()),
+        )
+
+    def test_running_twice_leaves_every_row_byte_identical(self):
+        self.fixture_a()
+        self.make_place("Blue Bottle", tags=["coffee"], neighborhood="Mission")
+        before = self.snapshot()
+
+        self.run_surprise(seed=1)
+        self.run_surprise(seed=2)
+
+        self.assertEqual(self.snapshot(), before)
+
+    def test_a_wishlist_place_that_comes_up_stays_on_the_wishlist(self):
+        self.make_place("Blue Bottle")
+
+        self.run_surprise(seed=0)
+
+        place = Place.objects.get(name="Blue Bottle")
+        self.assertEqual(place.status, Place.Status.WISHLIST)
+        self.assertIsNone(place.last_visited_at)
+
+    def test_the_command_issues_no_write_queries(self):
+        self.fixture_a()
+
+        with CaptureQueriesContext(connection) as captured:
+            self.run_surprise(seed=0)
+
+        for query in captured.captured_queries:
+            with self.subTest(sql=query["sql"][:60]):
+                self.assertNotRegex(query["sql"], r"(?i)^\s*(INSERT|UPDATE|DELETE)")
+
+    def test_the_same_place_may_be_suggested_twice_in_a_row(self):
+        """No memory, by design: a repeat is correct behavior, not a bug."""
+        self.make_place("Blue Bottle")
+
+        first, _ = self.run_surprise(seed=0)
+        second, _ = self.run_surprise(seed=0)
+
+        self.assertIn("Blue Bottle", first)
+        self.assertIn("Blue Bottle", second)
+
+
+class SurpriseQueryCountTests(SurpriseCommandTestCase):
+    """The headline names the place's tags, and ``Place.tags`` is a manager."""
+
+    def queries_for_a_draw(self):
+        with CaptureQueriesContext(connection) as captured:
+            self.run_surprise(seed=0)
+        return len(captured)
+
+    def populate(self, count, offset=0):
+        for index in range(offset, offset + count):
+            self.make_place(f"Coffee Number {index}", tags=["coffee", "wifi"])
+
+    def test_the_query_count_does_not_grow_with_the_journal(self):
+        self.populate(4)
+        few = self.queries_for_a_draw()
+
+        self.populate(16, offset=4)
+        many = self.queries_for_a_draw()
+
+        self.assertEqual(few, many)
+        self.assertLess(many, Place.objects.count())
