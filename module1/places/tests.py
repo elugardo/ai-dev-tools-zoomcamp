@@ -1258,6 +1258,54 @@ class AddCommandDuplicateNameTests(AddCommandTestCase):
 
         self.assertEqual(err, "")
 
+    def test_a_stored_name_that_merely_contains_the_new_one_is_not_a_duplicate(self):
+        """The direction that pins the anchoring, which the test above does not.
+
+        A longer *stored* name containing the new one is what an unanchored
+        comparison mistakes for a collision: adding ``Starbucks`` when only
+        ``Starbucks Reserve`` exists is a new place, not a repeat. The count in
+        the second half proves the Reserve row is excluded rather than merely
+        outnumbered.
+        """
+        self.run_add("Starbucks Reserve")
+
+        out, err = self.run_add("Starbucks")
+
+        self.assertEqual(err, "")
+
+        # With one genuine repeat now stored, the warning must still count only
+        # it -- one other place, not two.
+        out, err = self.run_add("Starbucks")
+
+        self.assertIn("1 other place", err)
+        self.assertNotIn("Reserve", err)
+
+    def test_a_name_full_of_regex_metacharacters_matches_only_itself(self):
+        """``+``, ``.`` and ``()`` are literal parts of a place's name.
+
+        The name being *added* is the one that has to be escaped, since it is
+        the one the comparison is built from -- so in each pair the plain
+        lookalike is stored first and the metacharacter-bearing name second.
+        Unescaped, ``A+B Deli`` would read as "one or more As", ``St. Frank``
+        as "any character", and ``Cafe (Mission)`` as a group matching the bare
+        text -- each one a false collision with the row already stored.
+        """
+        pairs = (
+            ("AB Deli", "A+B Deli"),
+            ("StX Frank", "St. Frank"),
+            ("Cafe Mission", "Cafe (Mission)"),
+        )
+        for stored, metacharacters in pairs:
+            with self.subTest(stored=stored, adding=metacharacters):
+                self.run_add(stored)
+
+                out, err = self.run_add(metacharacters)
+
+                self.assertEqual(err, "")
+                self.assertEqual(
+                    Place.objects.filter(name=metacharacters).count(), 1
+                )
+
     def test_the_warning_counts_the_other_places_not_this_one(self):
         self.run_add("Starbucks")
         self.run_add("Starbucks")
