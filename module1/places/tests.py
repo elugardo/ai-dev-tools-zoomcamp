@@ -2000,3 +2000,635 @@ class SearchDeterminismTests(unittest.TestCase):
             sorted(candidate.name for candidate in candidates)[:3],
             "test data must distinguish a lowercased sort from an ASCII one",
         )
+
+
+# ---------------------------------------------------------------------------
+# The `find` command (issue #6)
+#
+# `find` is a shell around `places/search.py`: it filters, hands candidates
+# over, and prints. Ranking itself is tested above, without a database.
+# ---------------------------------------------------------------------------
+
+
+def _find_module():
+    """The ``find`` command module, imported the way Django finds it."""
+    from places.management.commands import find as find_module
+
+    return find_module
+
+
+class FindCommandDiscoveryTests(SimpleTestCase):
+    """The command is discoverable and takes the documented flags."""
+
+    def parser(self):
+        return load_command_class("places", "find").create_parser("manage.py", "find")
+
+    def test_find_is_registered_as_a_command_of_the_places_app(self):
+        self.assertEqual(get_commands().get("find"), "places")
+
+    def test_help_documents_the_positional_query_and_every_flag(self):
+        help_text = self.parser().format_help()
+
+        self.assertIn("query", help_text)
+        for flag in ("--limit", "--status", "--neighborhood", "--tag"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+    def test_the_query_is_one_positional_string_not_a_list_of_words(self):
+        """``find "coffee wifi"`` is one query, not two."""
+        parsed = self.parser().parse_args(["coffee wifi"])
+
+        self.assertEqual(parsed.query, "coffee wifi")
+
+    def test_limit_defaults_to_five_and_is_an_integer(self):
+        parsed = self.parser().parse_args(["coffee"])
+
+        self.assertEqual(parsed.limit, 5)
+        self.assertEqual(self.parser().parse_args(["coffee", "--limit", "2"]).limit, 2)
+
+    def test_tag_is_a_repeatable_flag_not_a_comma_separated_string(self):
+        tag = next(a for a in self.parser()._actions if a.dest == "tags")
+
+        self.assertEqual(tag.option_strings, ["--tag"])
+        self.assertEqual(
+            self.parser().parse_args(["x", "--tag", "a", "--tag", "b"]).tags,
+            ["a", "b"],
+        )
+
+    def test_status_offers_exactly_the_models_two_choices(self):
+        status = next(a for a in self.parser()._actions if a.dest == "status")
+
+        self.assertEqual(list(status.choices), list(Place.Status.values))
+
+
+class FindCommandSourceRuleTests(SimpleTestCase):
+    """Rules issue #6 states as a grep over ``find.py``.
+
+    Deliberately source-level: each describes a mechanism the command must
+    *delegate* rather than reimplement, and a reimplementation would pass every
+    behavioral test right up until the ranker or the normalizer changes.
+    """
+
+    def test_find_delegates_ranking_and_owns_no_scoring_of_its_own(self):
+        source = inspect.getsource(_find_module())
+
+        self.assertIn("rank_places", source)
+        self.assertNotIn("rapidfuzz", source)
+        self.assertNotIn("fuzz", source)
+        self.assertNotIn("STRONG_MATCH_THRESHOLD", source)
+
+    def test_find_does_not_re_sort_what_the_ranker_returned(self):
+        source = inspect.getsource(_find_module())
+
+        self.assertNotIn("sorted(", source)
+        self.assertNotIn(".sort(", source)
+
+    def test_find_does_not_hand_roll_tag_normalization(self):
+        source = inspect.getsource(_find_module())
+
+        self.assertIn("normalize_tag_name", source)
+        self.assertNotIn("lower()", source)
+        self.assertNotIn("iexact", source)
+
+
+class FindCommandTestCase(TestCase):
+    """Shared plumbing: run ``find`` through ``call_command``, per
+    ``_docs/testing-guidelines.md``. Nothing here shells out."""
+
+    #: The header the fallback prints, without its count.
+    WEAK_HEADER = "No strong match. Closest"
+
+    def make_place(self, name, tags=(), **fields):
+        place = Place.objects.create(name=name, **fields)
+        for tag_name in tags:
+            place.tags.add(Tag.objects.get_or_create(name=tag_name)[0])
+        return place
+
+    def run_find(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("find", *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def run_find_from_command_line(self, *args):
+        """Drive ``find`` the way ``manage.py`` does, so exit codes are real.
+
+        See ``AddCommandTestCase.run_add_from_command_line``: setting
+        ``_called_from_command_line`` is what lets argparse's own exit status
+        surface without shelling out to ``manage.py``.
+        """
+        command = load_command_class("places", "find")
+        command._called_from_command_line = True
+        out, err = StringIO(), StringIO()
+        call_command(command, *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def assert_rejected(self, *args):
+        """Run a ``find`` the command itself validates away.
+
+        Returns the ``CommandError`` -- rendered by ``manage.py`` as a one-line
+        message with a non-zero exit -- after checking nothing was printed.
+        """
+        out = StringIO()
+        with self.assertRaises(CommandError) as caught:
+            call_command("find", *args, stdout=out)
+        self.assertEqual(out.getvalue(), "")
+        return caught.exception
+
+    def lines(self, out):
+        """The non-empty lines of captured output, header included."""
+        return [line for line in out.splitlines() if line.strip()]
+
+    def result_lines(self, out):
+        """The non-empty lines that are not the weak-match header."""
+        return [line for line in self.lines(out) if self.WEAK_HEADER not in line]
+
+
+class FindCommandResultTests(FindCommandTestCase):
+    """A populated journal, a query that hits."""
+
+    def test_a_matching_query_prints_one_line_per_matching_place(self):
+        self.make_place("Blue Bottle", neighborhood="Mission", note="good wifi")
+        self.make_place("Sightglass", neighborhood="SoMa", note="coffee, loud")
+
+        out, err = self.run_find("coffee")
+
+        self.assertIn("Sightglass", out)
+        self.assertEqual(len(self.result_lines(out)), 1)
+
+    def test_a_typo_still_finds_the_place(self):
+        self.make_place("Blue Bottle", note="the good wifi one")
+
+        out, err = self.run_find("blu bottl")
+
+        self.assertIn("Blue Bottle", out)
+
+    def test_results_are_printed_in_the_rankers_order_not_re_sorted(self):
+        """The name match outranks the note match, so it prints first --
+        alphabetically it would print second."""
+        self.make_place("Coffee Bar", neighborhood="Mission")
+        self.make_place("Aardvark Tea", neighborhood="SoMa", note="great coffee here")
+
+        out, err = self.run_find("coffee")
+
+        self.assertIn("Coffee Bar", out)
+        self.assertIn("Aardvark Tea", out)
+        self.assertLess(out.index("Coffee Bar"), out.index("Aardvark Tea"))
+
+    def test_a_strong_match_prints_no_weak_match_header(self):
+        self.make_place("Blue Bottle", note="good coffee")
+        self.make_place("Tartine", note="pastries")
+
+        out, err = self.run_find("coffee")
+
+        self.assertNotIn("No strong match", out)
+
+    def test_a_search_writes_nothing_to_stderr(self):
+        self.make_place("Blue Bottle", note="good coffee")
+
+        out, err = self.run_find("coffee")
+
+        self.assertEqual(err, "")
+
+    def test_a_search_mutates_nothing(self):
+        """``find`` only reads: no status flips, no timestamps, no counters."""
+        self.make_place("Blue Bottle", note="coffee", tags=["coffee"])
+        self.make_place("Tartine", note="pastry", status=Place.Status.VISITED)
+        before = list(Place.objects.values().order_by("id"))
+
+        self.run_find("coffee")
+        self.run_find("qqqqqq")
+
+        self.assertEqual(list(Place.objects.values().order_by("id")), before)
+
+
+class FindCommandLimitTests(FindCommandTestCase):
+    """``--limit`` caps strong matches and defaults to five."""
+
+    def populate(self, count):
+        for index in range(count):
+            self.make_place(f"Coffee Number {index}", note="espresso")
+
+    def test_without_a_limit_at_most_five_strong_matches_are_printed(self):
+        self.populate(8)
+
+        out, err = self.run_find("coffee")
+
+        self.assertEqual(len(self.result_lines(out)), 5)
+
+    def test_a_limit_caps_the_number_of_lines(self):
+        self.populate(8)
+
+        out, err = self.run_find("coffee", "--limit", "2")
+
+        self.assertEqual(len(self.result_lines(out)), 2)
+
+    def test_a_limit_larger_than_the_journal_prints_what_there_is(self):
+        self.populate(4)
+
+        out, err = self.run_find("coffee", "--limit", "100")
+
+        self.assertEqual(len(self.result_lines(out)), 4)
+        self.assertNotIn("No strong match", out)
+
+    def test_a_zero_or_negative_limit_is_rejected_by_name(self):
+        self.populate(4)
+
+        for limit in ("0", "-1", "-10"):
+            with self.subTest(limit=limit):
+                error = self.assert_rejected("coffee", "--limit", limit)
+
+                self.assertIn("--limit", str(error))
+
+
+class FindCommandArgumentTests(FindCommandTestCase):
+    """Only malformed invocations are errors."""
+
+    def test_a_missing_query_is_an_argparse_usage_error(self):
+        self.make_place("Blue Bottle")
+
+        with redirect_stderr(StringIO()) as captured:
+            with self.assertRaises(SystemExit) as caught:
+                self.run_find_from_command_line()
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertIn("query", captured.getvalue())
+
+    def test_a_blank_query_is_rejected_and_never_reaches_the_ranker(self):
+        for index in range(4):
+            self.make_place(f"Place {index}")
+
+        for query in ("", "   ", "\t"):
+            with self.subTest(query=repr(query)):
+                error = self.assert_rejected(query)
+
+                self.assertIn("query", str(error))
+
+    def test_a_query_of_only_punctuation_is_rejected_like_a_blank_one(self):
+        """``---`` survives ``strip()`` but carries no search intent: the
+        ranker only ever sees letters and digits, so such a query cannot
+        prefer one place to another. Guessing three places under a header that
+        says we looked would be a lie; see ``find.py``'s module docstring."""
+        for index in range(5):
+            self.make_place(f"Place {index}")
+
+        # ``--`` is argparse's end-of-options marker, not part of the query:
+        # without it a query starting with a dash is read as a flag, which is
+        # argparse's business and not this command's.
+        for query in ("---", "!!!", ".", "  !!  ", "?? -- ??"):
+            with self.subTest(query=query):
+                error = self.assert_rejected("--", query)
+
+                self.assertIn("letter", str(error))
+
+    def test_a_query_carrying_one_digit_is_a_real_query(self):
+        """The rejection is about having nothing to search for, not about
+        punctuation: ``4`` is searchable, ``!`` is not."""
+        self.make_place("Cafe 4", note="the one on the corner")
+
+        out, err = self.run_find("4!")
+
+        self.assertIn("Cafe 4", out)
+
+    def test_an_unrecognized_status_lists_the_valid_choices_and_prints_nothing(self):
+        self.make_place("Blue Bottle", note="coffee")
+
+        with redirect_stderr(StringIO()) as captured:
+            with self.assertRaises(SystemExit) as caught:
+                self.run_find_from_command_line("coffee", "--status", "vistied")
+
+        self.assertEqual(caught.exception.code, 2)
+        for choice in Place.Status.values:
+            with self.subTest(choice=choice):
+                self.assertIn(choice, captured.getvalue())
+        self.assertNotIn("Blue Bottle", captured.getvalue())
+
+    def test_a_well_formed_query_that_matches_nothing_is_not_an_error(self):
+        """Finding nothing is an answer: no exception, so ``manage.py`` exits
+        0 -- for a weak fallback, for dead filters, and for an empty journal."""
+        self.make_place("Blue Bottle", note="coffee")
+
+        for query, arguments in (
+            ("qqqqqq", ()),
+            ("qqqqqq", ("--tag", "nonexistent-tag")),
+        ):
+            with self.subTest(arguments=arguments):
+                self.run_find(query, *arguments)
+
+        Place.objects.all().delete()
+        self.run_find("anything")
+
+
+class FindCommandFilterTests(FindCommandTestCase):
+    """Filters narrow the candidate set in the ORM, before anything is scored."""
+
+    def setUp(self):
+        self.blue = self.make_place(
+            "Blue Bottle",
+            neighborhood="Mission District",
+            note="good wifi",
+            tags=["coffee", "wifi"],
+            status=Place.Status.VISITED,
+            rating=4,
+        )
+        self.sightglass = self.make_place(
+            "Sightglass",
+            neighborhood="SoMa",
+            note="good coffee, loud",
+            tags=["coffee"],
+        )
+        self.tartine = self.make_place(
+            "Tartine",
+            neighborhood="Mission District",
+            note="coffee is fine, pastries better",
+        )
+
+    def test_a_tag_filter_matches_the_stored_tag_whatever_case_is_typed(self):
+        for typed in ("Coffee", "COFFEE", "coffee", "cOfFeE"):
+            with self.subTest(typed=typed):
+                out, err = self.run_find("good", "--tag", typed)
+
+                self.assertIn("Blue Bottle", out)
+                self.assertIn("Sightglass", out)
+
+    def test_a_tag_filter_strips_surrounding_whitespace(self):
+        """The ``NOCASE`` collation folds case but does not strip, so this is
+        what pins the normalizer rather than the database."""
+        out, err = self.run_find("good", "--tag", "  Coffee  ")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertIn("Sightglass", out)
+
+    def test_a_tag_filter_excludes_a_place_that_does_not_carry_the_tag(self):
+        out, err = self.run_find("coffee", "--tag", "Coffee")
+
+        self.assertNotIn("Tartine", out)
+
+    def test_two_tags_are_anded_not_ored(self):
+        out, err = self.run_find("good", "--tag", "coffee", "--tag", "wifi")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Sightglass", out)
+
+    def test_status_narrows_to_one_side_of_the_journal(self):
+        out, err = self.run_find("good", "--status", Place.Status.VISITED)
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Sightglass", out)
+
+    def test_status_wishlist_never_returns_a_visited_place(self):
+        out, err = self.run_find("good", "--status", Place.Status.WISHLIST)
+
+        self.assertNotIn("Blue Bottle", out)
+        self.assertIn("Sightglass", out)
+
+    def test_neighborhood_matches_a_case_insensitive_substring(self):
+        out, err = self.run_find("good", "--neighborhood", "mission")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Sightglass", out)
+
+    def test_every_filter_can_be_combined_in_one_invocation(self):
+        out, err = self.run_find(
+            "good",
+            "--tag",
+            "Coffee",
+            "--status",
+            Place.Status.VISITED,
+            "--neighborhood",
+            "MISSION",
+            "--limit",
+            "5",
+        )
+
+        self.assertIn("Blue Bottle", out)
+        self.assertEqual(len(self.result_lines(out)), 1)
+
+    def test_a_filter_that_matches_nothing_says_so_and_prints_no_results(self):
+        out, err = self.run_find("good", "--tag", "nonexistent-tag")
+
+        self.assertNotIn("Blue Bottle", out)
+        self.assertNotIn("Sightglass", out)
+        self.assertNotIn("No strong match", out)
+        self.assertIn("filters", out)
+
+    def test_a_filter_that_matches_nothing_is_not_the_empty_journal_message(self):
+        out, err = self.run_find("good", "--tag", "nonexistent-tag")
+
+        self.assertNotIn("empty", out)
+
+
+class FindCommandFallbackTests(FindCommandTestCase):
+    """Below the ranker's threshold the tool guesses out loud."""
+
+    def populate(self, count, **fields):
+        return [self.make_place(f"Place {index}", **fields) for index in range(count)]
+
+    def test_a_weak_query_prints_the_exact_header_and_three_lines(self):
+        self.populate(6)
+
+        out, err = self.run_find("qqqqqq")
+
+        self.assertIn("No strong match. Closest 3:", out)
+        self.assertEqual(len(self.result_lines(out)), 3)
+
+    def test_the_fallback_is_capped_at_three_and_limit_does_not_widen_it(self):
+        self.populate(6)
+
+        out, err = self.run_find("qqqqqq", "--limit", "10")
+
+        self.assertIn("No strong match. Closest 3:", out)
+        self.assertEqual(len(self.result_lines(out)), 3)
+
+    def test_a_smaller_candidate_set_makes_the_header_name_its_real_count(self):
+        self.populate(2)
+
+        out, err = self.run_find("qqqqqq")
+
+        self.assertIn("No strong match. Closest 2:", out)
+        self.assertNotIn("Closest 3", out)
+        self.assertEqual(len(self.result_lines(out)), 2)
+
+    def test_the_fallback_never_reaches_past_a_tag_filter_to_fill_three_slots(self):
+        """Filters are hard; the threshold is soft. One tagged place out of
+        five means at most one guess, not three."""
+        self.populate(4)
+        self.make_place("Blue Bottle", tags=["coffee"])
+
+        out, err = self.run_find("qqqqqq", "--tag", "Coffee")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertIn("No strong match. Closest 1:", out)
+        self.assertEqual(len(self.result_lines(out)), 1)
+
+    def test_the_fallback_never_reaches_past_a_status_filter(self):
+        self.populate(4, status=Place.Status.VISITED)
+        self.make_place("Blue Bottle", status=Place.Status.WISHLIST)
+
+        out, err = self.run_find("qqqqqq", "--status", Place.Status.WISHLIST)
+
+        self.assertEqual(len(self.result_lines(out)), 1)
+        self.assertIn("Blue Bottle", out)
+
+    def test_the_fallback_never_reaches_past_a_neighborhood_filter(self):
+        self.populate(4, neighborhood="SoMa")
+        self.make_place("Blue Bottle", neighborhood="Mission District")
+
+        out, err = self.run_find("qqqqqq", "--neighborhood", "mission")
+
+        self.assertEqual(len(self.result_lines(out)), 1)
+        self.assertIn("Blue Bottle", out)
+
+
+class FindCommandEmptyJournalTests(FindCommandTestCase):
+    """Zero places is a different nothing from zero survivors."""
+
+    def test_an_empty_journal_says_so_and_points_at_add(self):
+        out, err = self.run_find("anything")
+
+        self.assertIn("empty", out)
+        self.assertIn("add", out)
+        self.assertNotIn("No strong match", out)
+
+    def test_the_empty_journal_message_is_not_the_dead_filter_message(self):
+        out, err = self.run_find("anything")
+
+        self.assertNotIn("filters", out)
+
+    def test_an_empty_journal_is_not_an_error(self):
+        self.run_find("anything", "--tag", "coffee", "--limit", "3")
+
+
+class FindCommandResultLineTests(FindCommandTestCase):
+    """One place, one readable line."""
+
+    def test_a_line_carries_name_neighborhood_status_rating_and_note(self):
+        self.make_place(
+            "Blue Bottle",
+            neighborhood="Mission",
+            note="good wifi before ten",
+            rating=4,
+            status=Place.Status.VISITED,
+            tags=["coffee"],
+        )
+
+        out, err = self.run_find("blue bottle")
+
+        line = self.result_lines(out)[0]
+        for fragment in ("Blue Bottle", "Mission", Place.Status.VISITED.value, "4"):
+            with self.subTest(fragment=fragment):
+                self.assertIn(fragment, line)
+        self.assertIn("good wifi", line)
+
+    def test_a_place_with_no_note_no_rating_and_no_neighborhood_prints_no_none(self):
+        self.make_place("Tartine")
+
+        out, err = self.run_find("tartine")
+
+        self.assertIn("Tartine", out)
+        self.assertNotIn("None", out)
+        self.assertNotIn("null", out)
+        self.assertEqual(len(self.result_lines(out)), 1)
+
+    def test_a_wishlist_place_with_a_note_but_no_rating_prints_no_none(self):
+        self.make_place("Tartine", neighborhood="Mission", note="the morning bun")
+
+        out, err = self.run_find("tartine")
+
+        self.assertNotIn("None", out)
+
+    def test_a_long_note_is_truncated_head_first_with_a_visible_marker(self):
+        self.make_place(
+            "Tartine",
+            note="the morning bun is the reason to come "
+            + "and more words " * 40
+            + "TAIL OF THE NOTE",
+        )
+
+        out, err = self.run_find("tartine")
+
+        self.assertIn("the morning bun", out)
+        self.assertNotIn("TAIL OF THE NOTE", out)
+        self.assertTrue(
+            "…" in out or "..." in out, "a truncated note must admit it was cut"
+        )
+        self.assertEqual(len(self.result_lines(out)), 1)
+
+    def test_a_note_with_newlines_still_prints_as_one_line(self):
+        self.make_place("Tartine", note="line one\nline two")
+
+        out, err = self.run_find("tartine")
+
+        self.assertEqual(len(self.lines(out)), 1)
+        self.assertIn("line one", out)
+        self.assertIn("line two", out)
+
+    def test_a_note_of_only_whitespace_prints_no_trailing_separator_junk(self):
+        self.make_place("Tartine", note="   \n  ")
+
+        out, err = self.run_find("tartine")
+
+        self.assertIn("Tartine", out)
+        self.assertNotIn("None", out)
+
+
+class FindCommandNonAsciiTests(FindCommandTestCase):
+    """Accents survive the round trip and nothing raises."""
+
+    def test_a_non_ascii_query_finds_the_place_with_its_accents_intact(self):
+        self.make_place("Café Réveille", neighborhood="Hayes Valley")
+
+        out, err = self.run_find("café")
+
+        self.assertIn("Café Réveille", out)
+
+    def test_a_non_ascii_neighborhood_filter_runs_clean(self):
+        self.make_place("Taco Spot", neighborhood="Barrio Logán")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, err = self.run_find("taco", "--neighborhood", "logán")
+
+        self.assertIn("Taco Spot", out)
+        self.assertNotIn("Blue Bottle", out)
+
+    def test_a_non_ascii_tag_filter_runs_clean(self):
+        self.make_place("Taco Spot", tags=["mañana"])
+
+        out, err = self.run_find("taco", "--tag", "Mañana")
+
+        self.assertIn("Taco Spot", out)
+
+
+class FindCommandQueryCountTests(FindCommandTestCase):
+    """The ranker reads every candidate's tags.
+
+    ``Place.tags`` is a related manager, so on un-prefetched rows that is one
+    query per candidate -- the ranker is pure in effect only when its caller
+    prefetches. This pins the caller's half of that bargain.
+    """
+
+    def populate(self, count, offset=0):
+        for index in range(offset, offset + count):
+            self.make_place(f"Coffee Number {index}", tags=["coffee", "wifi"])
+
+    def queries_for_a_search(self):
+        with CaptureQueriesContext(connection) as captured:
+            self.run_find("coffee")
+        return len(captured)
+
+    def test_the_query_count_does_not_grow_with_the_number_of_candidates(self):
+        self.populate(3)
+        few = self.queries_for_a_search()
+
+        self.populate(15, offset=3)
+        many = self.queries_for_a_search()
+
+        self.assertEqual(few, many)
+        self.assertLess(many, Place.objects.count())
+
+    def test_the_query_count_does_not_grow_when_filters_are_applied(self):
+        self.populate(12)
+
+        with CaptureQueriesContext(connection) as captured:
+            self.run_find("coffee", "--tag", "Coffee", "--status", "wishlist")
+
+        self.assertLess(len(captured), Place.objects.count())
