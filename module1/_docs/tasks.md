@@ -20,12 +20,14 @@ and passes that test.
 
 ## 2. Place and Tag models
 Goal: `Place` and `Tag` exist as migrated tables in SQLite.
-Description: Define `Tag` (unique `name`, lowercased on save) and `Place` (`name`,
+Description: Define `Tag` (unique `name`, lowercased on save, and looked up
+case-insensitively so `Coffee` resolves to the existing `coffee` instead of
+colliding with it) and `Place` (`name`,
 `neighborhood`, `address`, `note`, nullable `rating` 1–5, `status` of `wishlist`
 or `visited`, many-to-many `tags`, plus `created_at` and `last_visited_at`) in
 `places/models.py`, then generate and apply the migration. Add model tests
-covering tag lowercasing, the status default of `wishlist`, and that a place can
-be saved with no rating. Use a `TextChoices` class for `status` so the valid
+covering tag lowercasing on save, a mixed-case lookup finding the existing tag,
+the status default of `wishlist`, and that a place can be saved with no rating. Use a `TextChoices` class for `status` so the valid
 values live in one place.
 
 ## 3. Admin registration
@@ -42,7 +44,8 @@ Goal: `python manage.py add "Blue Bottle" --tag coffee --note "good wifi"` persi
 Description: Write a management command in `places/management/commands/add.py`
 that takes a positional name plus optional `--neighborhood`, `--address`,
 `--note`, `--rating`, and repeatable `--tag` flags. Tags are created on demand
-and reused if they already exist; a place with a rating is stored as `visited`
+and reused if they already exist, matched case-insensitively, so `--tag Coffee`
+attaches the existing `coffee` rather than failing; a place with a rating is stored as `visited`
 and one without as `wishlist`, unless `--status` says otherwise. Print a short
 confirmation line and cover the tag reuse and status inference in tests.
 
@@ -51,7 +54,7 @@ Goal: A pure, tested function ranks places against a query string.
 Description: Add `places/search.py` with a function that takes a query and a list
 of places and returns them scored and sorted, using `rapidfuzz` to compare the
 query against name, note, tags, and neighborhood, with name matches weighted
-highest. Define a confidence threshold, and when nothing clears it, return the
+highest. Lowercase both the query and the tag names before comparing. Define a confidence threshold, and when nothing clears it, return the
 three highest-scoring places flagged as weak matches instead of an empty list.
 This module must not import any management-command or CLI code — it takes data
 in and returns ranked data out, so it can be tested directly.
@@ -60,7 +63,7 @@ in and returns ranked data out, so it can be tested directly.
 Goal: `python manage.py find "coffee wifi"` prints ranked matches and never comes back empty.
 Description: Build the command on top of the ranking module from task 5, adding
 optional `--tag`, `--status`, and `--neighborhood` filters that narrow the
-candidate set before scoring, and a `--limit` that defaults to a handful of
+candidate set before scoring (`--tag` matches case-insensitively), and a `--limit` that defaults to a handful of
 results. When the ranker reports only weak matches, print a `No strong match.
 Closest 3:` header above them so the user knows the tool is guessing. Show each
 hit as one readable line with name, neighborhood, status, rating, and a snippet

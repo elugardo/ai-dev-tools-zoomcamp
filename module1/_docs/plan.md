@@ -31,6 +31,12 @@ neighborhood guide, not an errand/logistics helper.
 `Tag`
 - `name` — unique, lowercased on save
 
+**Tags are case-insensitive, end to end.** Names are lowercased when written and
+every lookup, filter, and comparison lowercases its input before matching, so
+`Coffee`, `COFFEE`, and `coffee` are one tag and always resolve to the existing
+row rather than colliding with it. Case never reaches the database, so nothing
+downstream has to think about it.
+
 ## Commands
 
 | Command | Behavior |

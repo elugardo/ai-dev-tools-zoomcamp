@@ -30,6 +30,9 @@ activate. `uv sync` is idempotent — run it after pulling if dependencies moved
 - The CLI is built from Django management commands in
   `places/management/commands/`. The only web surface is the stock Django admin —
   do not add custom views, templates, or URLs.
+- **Tags are always lowercase**, on write *and* on read. Lowercase the input to
+  every tag lookup, filter, or comparison — never just on save, or `Coffee` will
+  fail to find the stored `coffee` and try to create a duplicate.
 - Never commit `.venv/` or `db.sqlite3`; both are gitignored.
 - Scope lives in `module1/_docs/plan.md`. Do not silently build something outside
   it — propose the change, get agreement, then update the plan.
