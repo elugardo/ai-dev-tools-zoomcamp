@@ -17,8 +17,9 @@ again before closing one.
 - **Work on a branch** named for the issue: `1-project-skeleton`,
   `5-fuzzy-ranking`. Never commit feature work directly to `main`.
 - **Commit regularly** — at each point the tests pass, not once at the end.
-  Reference the issue in the commit body (`Refs #5`), and use `Closes #5` on the
-  commit or PR that finishes it.
+  Reference the issue in the commit body as `Refs #5`. Never use `Closes #5` in a
+  commit: it hands the close to GitHub at merge, which skips the QA gate below.
+  The orchestrator adds the closing reference to the PR after QA returns PASS.
 - **Leave the suite green.** `manage.py test` must pass before any commit.
 
 ## Roles
