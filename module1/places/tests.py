@@ -1786,6 +1786,20 @@ class SearchThresholdTests(unittest.TestCase):
         self.assertEqual(len(results), len(many))
         self.assertGreater(len(results), search.WEAK_MATCH_LIMIT)
 
+    def test_a_real_score_landing_exactly_on_the_threshold_is_strong(self):
+        """The boundary hit without patching anything: a note-only match at
+        0.80 x 75.0 scores 60.00, dead on the constant, and must count as
+        strong. If the weights are retuned this test fails loudly, which is the
+        point -- 60 is chosen so the issue's examples land on the right side of
+        it."""
+        on_the_line = place("Quiet Corner", note="abce")
+
+        results = search.rank_places("abcd", [on_the_line])
+
+        self.assertEqual(results[0].score, search.STRONG_MATCH_THRESHOLD)
+        self.assertFalse(results.is_weak)
+        self.assertFalse(results[0].is_weak)
+
     def test_a_score_exactly_equal_to_the_threshold_counts_as_strong(self):
         """Inclusive, not exclusive. Pinning the threshold to a score the
         module actually produced is the only way to hit the boundary exactly
@@ -1943,23 +1957,35 @@ class SearchDeterminismTests(unittest.TestCase):
             self.assertEqual(shuffled, baseline)
 
     def test_ties_are_broken_by_lowercased_name_ascending(self):
-        zulu = place("zulu bar", tags=["coffee"])
-        alpha = place("Alpha Bar", tags=["coffee"])
-        mike = place("mike bar", tags=["coffee"])
+        """The names discriminate on purpose: a raw ASCII sort puts every
+        capital ahead of every lowercase letter, so it would answer
+        ``Mike Bar, Zulu Bar, alpha bar``. Only a lowercased key gives the
+        alphabetical order below."""
+        zulu = place("Zulu Bar", tags=["coffee"])
+        alpha = place("alpha bar", tags=["coffee"])
+        mike = place("Mike Bar", tags=["coffee"])
 
         results = search.rank_places("coffee", [zulu, mike, alpha])
 
         self.assertEqual(len({result.score for result in results}), 1)
         self.assertEqual(
             [result.place.name for result in results],
-            ["Alpha Bar", "mike bar", "zulu bar"],
+            ["alpha bar", "Mike Bar", "Zulu Bar"],
+        )
+        self.assertNotEqual(
+            [result.place.name for result in results],
+            sorted(candidate.name for candidate in (zulu, mike, alpha)),
+            "test data must distinguish a lowercased sort from an ASCII one",
         )
 
     def test_the_tie_break_also_decides_which_three_the_fallback_picks(self):
+        """Same trap, one level up: an ASCII sort of these five would hand back
+        ``Bravo, Delta, alpha`` -- a different three, not merely a different
+        order."""
         candidates = [
             place("echo"),
-            place("Alpha"),
-            place("delta"),
+            place("alpha"),
+            place("Delta"),
             place("Bravo"),
             place("charlie"),
         ]
@@ -1967,5 +1993,10 @@ class SearchDeterminismTests(unittest.TestCase):
         results = search.rank_places("zzzzqqq", candidates)
 
         self.assertEqual(
-            [result.place.name for result in results], ["Alpha", "Bravo", "charlie"]
+            [result.place.name for result in results], ["alpha", "Bravo", "charlie"]
+        )
+        self.assertNotEqual(
+            [result.place.name for result in results],
+            sorted(candidate.name for candidate in candidates)[:3],
+            "test data must distinguish a lowercased sort from an ASCII one",
         )
