@@ -44,7 +44,7 @@ downstream has to think about it.
 | `add` | Create a place. Flags for tags/note/rating/neighborhood/status. Defaults to `wishlist` if no rating given. |
 | `find <query>` | **Fuzzy + ranked keyword** search over name, note, tags, neighborhood. Typo-tolerant. Optional `--tag`, `--status`, `--neighborhood` filters. Never returns nothing: below the score threshold it falls back to the closest 3, labelled as weak matches. |
 | `todo` | List `wishlist` places — what I haven't gotten to yet. Filterable by tag/neighborhood. |
-| `visit <place>` | Flip a place to `visited`, stamp `last_visited_at`, prompt for note + rating. |
+| `visit <place>` | Flip a place to `visited`, stamp `last_visited_at`, and take the note + rating as `--note`/`--rating` flags. Non-interactive: no prompting, so the command stays scriptable and testable through `call_command`. |
 | `surprise` | Pick one place to go to — random, biased toward long-unvisited or never-visited. Fights the "same three spots" rut. |
 | `stats` | Coverage: places per neighborhood, top tags, visited vs wishlist counts, how many neighborhoods touched. |
 
@@ -70,8 +70,8 @@ highest-scoring places, under a header that says they are weak matches (e.g.
    empty: below the confidence threshold it offers the closest 3 as weak matches.
 
 3. **Want-to-go → been-there loop.** Every place is `wishlist` or `visited`.
-   `todo` shows what I still owe the city; `visit` flips a place over and asks
-   for the note and rating while the memory is fresh.
+   `todo` shows what I still owe the city; `visit` flips a place over and takes
+   the note and rating while the memory is fresh.
 
 4. **Nudges and coverage.** `surprise` picks somewhere to go, favoring the
    never-visited and the long-neglected. `stats` shows how much of the city I've

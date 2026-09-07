@@ -22,7 +22,7 @@ not a neighborhood guide.
    across name, note, tags, and neighborhood, which never comes back empty: below
    the confidence threshold it offers the closest 3 as weak matches.
 3. **Want-to-go → been-there loop.** Every place is `wishlist` or `visited`.
-   `todo` shows what I still owe the city; `visit` flips a place over and asks for
+   `todo` shows what I still owe the city; `visit` flips a place over and takes
    the note and rating while the memory is fresh.
 4. **Nudges and coverage.** `surprise` picks somewhere to go, favoring the
    never-visited and long-neglected. `stats` shows how much of the city I have
