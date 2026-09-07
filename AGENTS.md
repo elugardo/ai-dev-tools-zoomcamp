@@ -45,4 +45,6 @@ activate. `uv sync` is idempotent — run it after pulling if dependencies moved
 - For the task list behind GitHub issues #1–#10, read `module1/_docs/tasks.md`.
 - Before grooming an issue, read `module1/_docs/team/pm.md` and write the result
   into the four sections of `module1/_docs/task-template.md`.
+- Before implementing a groomed issue, read
+  `module1/_docs/team/software-engineer.md`.
 

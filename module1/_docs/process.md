@@ -29,6 +29,10 @@ name.
 - **PM** — grooms a task before anyone implements it, follows
   [`team/pm.md`](team/pm.md). Decides what "done" means, names the edge cases,
   and writes no code.
+- **Software Engineer** — implements one groomed task at a time, follows
+  [`team/software-engineer.md`](team/software-engineer.md). Builds against the
+  acceptance criteria without changing them, writes tests, commits regularly, and
+  does not close the issue.
 
 ## Order and dependencies
 
