@@ -1,12 +1,16 @@
+import inspect
 import unittest
 import warnings
+from contextlib import redirect_stderr
 from datetime import datetime, timezone
+from io import StringIO
 
 from django.apps import apps
 from django.contrib import admin
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
-from django.core.management import call_command
+from django.core.management import call_command, get_commands, load_command_class
+from django.core.management.base import CommandError
 from django.core.paginator import UnorderedObjectListWarning
 from django.db import IntegrityError, connection, transaction
 from django.db.models import Q
@@ -884,3 +888,547 @@ class TagAdminFormTests(AdminTestCase):
         place.refresh_from_db()
         self.assertEqual(place.name, "Bar Alto")
         self.assertEqual(place.tags.count(), 0)
+
+# ---------------------------------------------------------------------------
+# The `add` command (issue #4)
+# ---------------------------------------------------------------------------
+
+
+def _add_module():
+    """The ``add`` command module, imported the way Django finds it."""
+    from places.management.commands import add as add_module
+
+    return add_module
+
+
+class AddCommandDiscoveryTests(SimpleTestCase):
+    """The command is discoverable and takes the documented flags.
+
+    No database work here, so ``SimpleTestCase``.
+    """
+
+    def parser(self):
+        return load_command_class("places", "add").create_parser("manage.py", "add")
+
+    def test_add_is_registered_as_a_command_of_the_places_app(self):
+        """What ``manage.py help`` lists under ``[places]`` comes from here."""
+        self.assertEqual(get_commands().get("add"), "places")
+
+    def test_help_documents_the_positional_name_and_every_flag(self):
+        help_text = self.parser().format_help()
+
+        self.assertIn("name", help_text)
+        for flag in (
+            "--neighborhood",
+            "--address",
+            "--note",
+            "--rating",
+            "--status",
+            "--tag",
+        ):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+    def test_tag_is_a_repeatable_flag_not_a_comma_separated_string(self):
+        tag = next(a for a in self.parser()._actions if a.dest == "tags")
+
+        self.assertEqual(tag.option_strings, ["--tag"])
+        self.assertEqual(
+            self.parser().parse_args(["X", "--tag", "a", "--tag", "b"]).tags,
+            ["a", "b"],
+        )
+
+    def test_status_offers_exactly_the_models_two_choices(self):
+        status = next(a for a in self.parser()._actions if a.dest == "status")
+
+        self.assertEqual(list(status.choices), list(Place.Status.values))
+
+    def test_there_is_no_flag_for_setting_the_visit_date(self):
+        """Stamping ``last_visited_at`` belongs to ``visit`` (#7), so ``add``
+        must not grow a date flag by accident."""
+        help_text = self.parser().format_help()
+
+        self.assertNotIn("last_visited_at", {a.dest for a in self.parser()._actions})
+        for option in ("--last-visited", "--visited-on", "--date"):
+            with self.subTest(option=option):
+                self.assertNotIn(option, help_text)
+
+
+class AddCommandSourceRuleTests(SimpleTestCase):
+    """Two rules issue #4 states as a grep over ``add.py``.
+
+    These are deliberately source-level rather than behavioral: both describe a
+    *mechanism* the command must reuse instead of reimplementing, and a
+    reimplementation would pass every behavioral test right up until the day
+    the shared normalizer or the choices class changes.
+    """
+
+    def test_add_does_not_hand_roll_tag_normalization(self):
+        source = inspect.getsource(_add_module())
+
+        self.assertNotIn("lower", source)
+        self.assertNotIn("iexact", source)
+        self.assertIn("normalize_tag_name", source)
+
+    def test_add_refers_to_the_status_choices_class_not_to_string_literals(self):
+        source = inspect.getsource(_add_module())
+
+        self.assertNotIn('"%s"' % Place.Status.WISHLIST.value, source)
+        self.assertNotIn('"%s"' % Place.Status.VISITED.value, source)
+        self.assertIn("Place.Status", source)
+
+
+class AddCommandTestCase(TestCase):
+    """Shared plumbing: run ``add`` through ``call_command`` and capture both
+    streams, per ``_docs/testing-guidelines.md``. Nothing here shells out."""
+
+    def run_add(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("add", *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def run_add_from_command_line(self, *args):
+        """Drive ``add`` the way ``manage.py`` does, so exit codes are real.
+
+        ``call_command`` on its own downgrades argparse's usage error into a
+        ``CommandError``, because ``CommandParser.error`` only calls argparse's
+        own ``error`` -- the one that exits 2 -- when the command knows it was
+        invoked from the command line. ``manage.py`` sets that flag; setting it
+        here is what lets these tests pin the real exit status without shelling
+        out to ``manage.py``, which the testing guidelines forbid.
+        """
+        command = load_command_class("places", "add")
+        command._called_from_command_line = True
+        out, err = StringIO(), StringIO()
+        call_command(command, *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def assert_rejected(self, *args):
+        """Run an ``add`` the command itself validates away.
+
+        Returns the ``CommandError`` -- which ``manage.py`` renders as a
+        one-line message on stderr with exit status 1 -- after checking that
+        neither table grew.
+        """
+        before = (Place.objects.count(), Tag.objects.count())
+        with self.assertRaises(CommandError) as caught:
+            self.run_add(*args)
+        self.assertEqual((Place.objects.count(), Tag.objects.count()), before)
+        return caught.exception
+
+
+class AddCommandStorageTests(AddCommandTestCase):
+    """What lands in the database."""
+
+    def test_a_name_on_its_own_creates_a_place(self):
+        self.run_add("Tartine")
+
+        self.assertEqual(Place.objects.count(), 1)
+        self.assertEqual(Place.objects.get().name, "Tartine")
+
+    def test_every_text_flag_is_stored_verbatim(self):
+        self.run_add(
+            "Blue Bottle",
+            "--neighborhood",
+            "Mission",
+            "--address",
+            "66 Mint St",
+            "--note",
+            "good wifi",
+        )
+
+        place = Place.objects.get()
+        self.assertEqual(place.name, "Blue Bottle")
+        self.assertEqual(place.neighborhood, "Mission")
+        self.assertEqual(place.address, "66 Mint St")
+        self.assertEqual(place.note, "good wifi")
+
+    def test_the_place_name_keeps_its_capitalization(self):
+        """Only tags get a canonical case -- never the place name."""
+        self.run_add("Blue Bottle")
+
+        self.assertEqual(Place.objects.get().name, "Blue Bottle")
+
+    def test_surrounding_whitespace_is_stripped_from_every_text_value(self):
+        self.run_add(
+            "  Tartine  ",
+            "--neighborhood",
+            "  Mission ",
+            "--address",
+            " 600 Guerrero St  ",
+            "--note",
+            "  morning bun  ",
+            "--tag",
+            "  Pastry  ",
+        )
+
+        place = Place.objects.get()
+        self.assertEqual(place.name, "Tartine")
+        self.assertEqual(place.neighborhood, "Mission")
+        self.assertEqual(place.address, "600 Guerrero St")
+        self.assertEqual(place.note, "morning bun")
+        self.assertEqual([t.name for t in place.tags.all()], ["pastry"])
+
+    def test_omitted_text_flags_are_empty_strings_not_none(self):
+        self.run_add("Tartine")
+
+        place = Place.objects.get()
+        self.assertEqual(place.neighborhood, "")
+        self.assertEqual(place.address, "")
+        self.assertEqual(place.note, "")
+
+    def test_add_creates_exactly_one_row_and_leaves_other_places_alone(self):
+        existing = Place.objects.create(name="Bar Alto", neighborhood="SoMa", rating=3)
+
+        self.run_add("Tartine")
+
+        self.assertEqual(Place.objects.count(), 2)
+        existing.refresh_from_db()
+        self.assertEqual(existing.neighborhood, "SoMa")
+        self.assertEqual(existing.rating, 3)
+
+
+class AddCommandTagTests(AddCommandTestCase):
+    """Tags: created on demand, reused whatever case they were typed in."""
+
+    def test_tag_is_repeatable_and_attaches_every_value(self):
+        self.run_add("Blue Bottle", "--tag", "coffee", "--tag", "wifi")
+
+        place = Place.objects.get()
+        self.assertEqual(sorted(t.name for t in place.tags.all()), ["coffee", "wifi"])
+
+    def test_an_unknown_tag_is_created_in_canonical_form(self):
+        before = Tag.objects.count()
+
+        self.run_add("Tartine", "--tag", "Pastry")
+
+        self.assertEqual(Tag.objects.count(), before + 1)
+        self.assertEqual(Tag.objects.get().name, "pastry")
+
+    def test_an_existing_tag_is_reused_whatever_case_is_typed(self):
+        for typed in ("Coffee", "COFFEE", "CoFfEe", "  coffee "):
+            with self.subTest(typed=typed):
+                Tag.objects.get_or_create(name="coffee")
+                before = Tag.objects.count()
+
+                self.run_add("Blue Bottle", "--tag", typed)
+
+                self.assertEqual(Tag.objects.count(), before)
+                self.assertEqual(Tag.objects.filter(name="coffee").count(), 1)
+                self.assertEqual(
+                    [t.name for t in Place.objects.latest("pk").tags.all()], ["coffee"]
+                )
+
+    def test_the_same_tag_twice_in_one_command_attaches_once(self):
+        before = Tag.objects.count()
+
+        self.run_add("Blue Bottle", "--tag", "coffee", "--tag", "Coffee")
+
+        self.assertEqual(Place.objects.get().tags.count(), 1)
+        self.assertEqual(Tag.objects.count(), before + 1)
+
+    def test_two_places_added_separately_share_one_tag_row(self):
+        self.run_add("Blue Bottle", "--tag", "coffee")
+        self.run_add("Sightglass", "--tag", "Coffee")
+
+        self.assertEqual(Tag.objects.count(), 1)
+        self.assertEqual(Tag.objects.get().places.count(), 2)
+
+    def test_attaching_a_tag_never_detaches_it_from_another_place(self):
+        coffee = Tag.objects.create(name="coffee")
+        sightglass = Place.objects.create(name="Sightglass")
+        sightglass.tags.add(coffee)
+
+        self.run_add("Blue Bottle", "--tag", "Coffee")
+
+        self.assertEqual(sightglass.tags.count(), 1)
+        self.assertEqual(coffee.places.count(), 2)
+
+    def test_a_place_added_with_no_tags_has_none(self):
+        self.run_add("Tartine")
+
+        self.assertEqual(Place.objects.get().tags.count(), 0)
+
+
+class AddCommandStatusTests(AddCommandTestCase):
+    """Inference, and what an explicit ``--status`` does to it."""
+
+    def test_no_rating_and_no_status_lands_on_the_wishlist(self):
+        self.run_add("Tartine")
+
+        place = Place.objects.get()
+        self.assertEqual(place.status, Place.Status.WISHLIST)
+        self.assertIsNone(place.rating)
+
+    def test_a_rating_alone_implies_the_place_was_visited(self):
+        self.run_add("Blue Bottle", "--rating", "4")
+
+        place = Place.objects.get()
+        self.assertEqual(place.status, Place.Status.VISITED)
+        self.assertEqual(place.rating, 4)
+
+    def test_an_explicit_status_overrides_the_rating_inference_silently(self):
+        out, err = self.run_add(
+            "Blue Bottle", "--rating", "4", "--status", Place.Status.WISHLIST.value
+        )
+
+        place = Place.objects.get()
+        self.assertEqual(place.status, Place.Status.WISHLIST)
+        self.assertEqual(place.rating, 4)
+        self.assertEqual(err, "")
+
+    def test_an_explicit_visited_status_needs_no_rating(self):
+        out, err = self.run_add("Tartine", "--status", Place.Status.VISITED.value)
+
+        place = Place.objects.get()
+        self.assertEqual(place.status, Place.Status.VISITED)
+        self.assertIsNone(place.rating)
+        self.assertEqual(err, "")
+
+    def test_the_boundary_ratings_are_accepted(self):
+        for rating in ("1", "5"):
+            with self.subTest(rating=rating):
+                self.run_add("Place %s" % rating, "--rating", rating)
+
+                place = Place.objects.get(name="Place %s" % rating)
+                self.assertEqual(place.rating, int(rating))
+                self.assertEqual(place.status, Place.Status.VISITED)
+
+
+class AddCommandLastVisitedTests(AddCommandTestCase):
+    """``add`` never stamps the visit timestamp -- that is #7's job."""
+
+    def test_last_visited_at_is_none_after_any_successful_add(self):
+        cases = (
+            ("Tartine", ()),
+            ("Blue Bottle", ("--rating", "5")),
+            ("Sightglass", ("--status", Place.Status.VISITED.value)),
+            ("Bar Alto", ("--rating", "5", "--status", Place.Status.VISITED.value)),
+        )
+        for name, flags in cases:
+            with self.subTest(name=name, flags=flags):
+                self.run_add(name, *flags)
+
+                self.assertIsNone(Place.objects.get(name=name).last_visited_at)
+
+
+class AddCommandDuplicateNameTests(AddCommandTestCase):
+    """A repeated name is allowed, and warned about on stderr."""
+
+    def test_a_second_place_with_the_same_name_is_created_not_merged(self):
+        self.run_add("Starbucks", "--neighborhood", "Mission")
+        self.run_add("Starbucks", "--neighborhood", "SoMa")
+
+        self.assertEqual(Place.objects.filter(name="Starbucks").count(), 2)
+        self.assertEqual(
+            sorted(p.neighborhood for p in Place.objects.all()), ["Mission", "SoMa"]
+        )
+
+    def test_the_second_add_warns_on_stderr_and_still_succeeds(self):
+        self.run_add("Starbucks")
+
+        out, err = self.run_add("Starbucks")
+
+        self.assertIn("Starbucks", err)
+        self.assertIn("already named", err)
+        self.assertNotIn("already named", out)
+        self.assertIn("Added", out)
+
+    def test_the_duplicate_check_ignores_case_but_never_changes_what_is_stored(self):
+        self.run_add("Starbucks")
+
+        out, err = self.run_add("starbucks")
+
+        self.assertIn("Starbucks", err)
+        self.assertEqual(
+            sorted(p.name for p in Place.objects.all()), ["Starbucks", "starbucks"]
+        )
+
+    def test_a_new_name_prints_no_warning(self):
+        self.run_add("Starbucks")
+
+        out, err = self.run_add("Tartine")
+
+        self.assertEqual(err, "")
+
+    def test_a_name_that_merely_contains_another_is_not_a_duplicate(self):
+        self.run_add("Starbucks")
+
+        out, err = self.run_add("Starbucks Reserve")
+
+        self.assertEqual(err, "")
+
+    def test_a_stored_name_that_merely_contains_the_new_one_is_not_a_duplicate(self):
+        """The direction that pins the anchoring, which the test above does not.
+
+        A longer *stored* name containing the new one is what an unanchored
+        comparison mistakes for a collision: adding ``Starbucks`` when only
+        ``Starbucks Reserve`` exists is a new place, not a repeat. The count in
+        the second half proves the Reserve row is excluded rather than merely
+        outnumbered.
+        """
+        self.run_add("Starbucks Reserve")
+
+        out, err = self.run_add("Starbucks")
+
+        self.assertEqual(err, "")
+
+        # With one genuine repeat now stored, the warning must still count only
+        # it -- one other place, not two.
+        out, err = self.run_add("Starbucks")
+
+        self.assertIn("1 other place", err)
+        self.assertNotIn("Reserve", err)
+
+    def test_a_name_full_of_regex_metacharacters_matches_only_itself(self):
+        """``+``, ``.`` and ``()`` are literal parts of a place's name.
+
+        The name being *added* is the one that has to be escaped, since it is
+        the one the comparison is built from -- so in each pair the plain
+        lookalike is stored first and the metacharacter-bearing name second.
+        Unescaped, ``A+B Deli`` would read as "one or more As", ``St. Frank``
+        as "any character", and ``Cafe (Mission)`` as a group matching the bare
+        text -- each one a false collision with the row already stored.
+        """
+        pairs = (
+            ("AB Deli", "A+B Deli"),
+            ("StX Frank", "St. Frank"),
+            ("Cafe Mission", "Cafe (Mission)"),
+        )
+        for stored, metacharacters in pairs:
+            with self.subTest(stored=stored, adding=metacharacters):
+                self.run_add(stored)
+
+                out, err = self.run_add(metacharacters)
+
+                self.assertEqual(err, "")
+                self.assertEqual(
+                    Place.objects.filter(name=metacharacters).count(), 1
+                )
+
+    def test_the_warning_counts_the_other_places_not_this_one(self):
+        self.run_add("Starbucks")
+        self.run_add("Starbucks")
+
+        out, err = self.run_add("Starbucks")
+
+        self.assertIn("2", err)
+        self.assertEqual(Place.objects.count(), 3)
+
+
+class AddCommandInvalidInputTests(AddCommandTestCase):
+    """Nothing is written, and the exit code is non-zero."""
+
+    def test_a_blank_name_is_rejected_with_a_message_about_the_name(self):
+        for name in ("", "   "):
+            with self.subTest(name=repr(name)):
+                error = self.assert_rejected(name)
+
+                self.assertIn("name", str(error))
+
+    def test_a_rating_outside_one_to_five_names_the_allowed_range(self):
+        for rating in ("0", "6"):
+            with self.subTest(rating=rating):
+                error = self.assert_rejected("Blue Bottle", "--rating", rating)
+
+                self.assertIn("1", str(error))
+                self.assertIn("5", str(error))
+
+    def test_a_blank_tag_is_rejected(self):
+        for tag in ("", "   "):
+            with self.subTest(tag=repr(tag)):
+                error = self.assert_rejected("Blue Bottle", "--tag", tag)
+
+                self.assertIn("tag", str(error))
+
+    def test_a_rejected_run_leaves_no_orphan_tag_behind(self):
+        """The bug this guards: create the tag, then fail on the rating."""
+        self.assert_rejected("Blue Bottle", "--tag", "coffee", "--rating", "9")
+
+        self.assertEqual(Tag.objects.count(), 0)
+        self.assertEqual(Place.objects.count(), 0)
+
+    def test_a_rejected_run_leaves_existing_rows_untouched(self):
+        Tag.objects.create(name="coffee")
+        Place.objects.create(name="Sightglass")
+
+        self.assert_rejected("Blue Bottle", "--tag", "wifi", "--rating", "0")
+
+        self.assertEqual(Tag.objects.count(), 1)
+        self.assertEqual(Place.objects.count(), 1)
+
+    def test_argparse_rejects_a_non_integer_rating_before_the_command_body_runs(self):
+        """``--rating abc`` and ``--rating 4.5`` exit 2 -- argparse's code, not
+        ours -- because a rating is a whole number."""
+        for rating in ("abc", "4.5"):
+            with self.subTest(rating=rating):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        self.run_add_from_command_line(
+                            "Blue Bottle", "--rating", rating
+                        )
+
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(Place.objects.count(), 0)
+
+    def test_argparse_rejects_an_unknown_status_before_the_command_body_runs(self):
+        with redirect_stderr(StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                self.run_add_from_command_line("Tartine", "--status", "nope")
+
+        self.assertEqual(caught.exception.code, 2)
+        self.assertEqual(Place.objects.count(), 0)
+
+
+class AddCommandOutputTests(AddCommandTestCase):
+    """One clean line on stdout describing what was stored."""
+
+    def test_a_successful_add_prints_exactly_one_line(self):
+        out, err = self.run_add(
+            "Blue Bottle",
+            "--neighborhood",
+            "Mission",
+            "--tag",
+            "coffee",
+            "--rating",
+            "4",
+        )
+
+        self.assertEqual(len(out.strip().splitlines()), 1)
+
+    def test_the_line_names_the_place_its_status_its_rating_and_its_tags(self):
+        out, err = self.run_add(
+            "Blue Bottle",
+            "--neighborhood",
+            "Mission",
+            "--tag",
+            "Coffee",
+            "--tag",
+            "wifi",
+            "--rating",
+            "4",
+        )
+
+        self.assertIn("Blue Bottle", out)
+        self.assertIn(Place.Status.VISITED.value, out)
+        self.assertIn("4", out)
+        self.assertIn("coffee", out)
+        self.assertIn("wifi", out)
+
+    def test_the_line_reflects_the_stored_tag_not_the_typed_one(self):
+        out, err = self.run_add("Blue Bottle", "--tag", "Coffee")
+
+        self.assertIn("coffee", out)
+        self.assertNotIn("Coffee", out)
+
+    def test_a_wishlist_add_says_so_and_mentions_no_rating(self):
+        out, err = self.run_add("Tartine")
+
+        self.assertIn("Tartine", out)
+        self.assertIn(Place.Status.WISHLIST.value, out)
+        self.assertNotIn("rating", out)
+
+    def test_a_successful_add_writes_nothing_to_stderr(self):
+        out, err = self.run_add("Tartine", "--tag", "pastry")
+
+        self.assertEqual(err, "")
