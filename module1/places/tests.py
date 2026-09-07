@@ -3266,6 +3266,40 @@ class VisitCommandFlipTests(VisitCommandTestCase):
             sorted(tag.name for tag in place.tags.all()), ["coffee", "wifi"]
         )
 
+    def test_the_write_names_the_fields_it_touches_rather_than_saving_the_row(self):
+        """A narrow ``update_fields`` write, pinned where it can actually fail.
+
+        The test above passes under a bare ``place.save()`` too, because
+        nothing else has changed on the in-memory instance for a full save to
+        carry into the database. So dirty a second field on the instance the
+        command is about to save -- exactly what a future bug, or a model with
+        a ``save()`` of its own, would do -- and check the database refused it.
+        """
+        place = self.make_place(
+            "Blue Bottle", neighborhood="Mission", note="heard good things"
+        )
+        resolve_place = _lookup_module().resolve_place
+
+        def resolve_and_dirty(*args, **kwargs):
+            resolved = resolve_place(*args, **kwargs)
+            resolved.name = "Somewhere Else"
+            resolved.neighborhood = "Nowhere"
+            return resolved
+
+        with mock.patch(
+            "places.management.commands.visit.resolve_place",
+            side_effect=resolve_and_dirty,
+        ):
+            self.run_visit("Blue Bottle", "--note", "great cortado")
+
+        place.refresh_from_db()
+        self.assertEqual(place.name, "Blue Bottle")
+        self.assertEqual(place.neighborhood, "Mission")
+        # ...while the fields `visit` does own were written.
+        self.assertEqual(place.status, Place.Status.VISITED)
+        self.assertEqual(place.note, "great cortado")
+        self.assertIsNotNone(place.last_visited_at)
+
 
 class VisitCommandResolutionTests(VisitCommandTestCase):
     """The resolution rule, seen from the command."""
@@ -3418,6 +3452,25 @@ class VisitCommandNoteAndRatingTests(VisitCommandTestCase):
 
         place.refresh_from_db()
         self.assertEqual(place.note, "heard good things")
+
+    def test_surrounding_whitespace_is_stripped_from_a_note(self):
+        """A note is stored the way ``add`` stores one: stripped."""
+        place = self.make_place("Blue Bottle")
+
+        self.run_visit("Blue Bottle", "--note", "  great cortado  ")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "great cortado")
+
+    def test_a_whitespace_only_note_clears_the_note_like_an_empty_one(self):
+        """Deliberate, and the same rule ``add`` follows: a note of nothing but
+        spaces is a note of nothing."""
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.run_visit("Blue Bottle", "--note", "   ")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "")
 
     def test_a_rating_is_stored_and_replaces_any_previous_one(self):
         place = self.make_place("Blue Bottle", rating=2)
@@ -3908,6 +3961,25 @@ class TodoCommandFilterTests(TodoCommandTestCase):
                 self.assertEqual(out, baseline)
                 self.assertIn("Blue Bottle", out)
 
+    def test_the_tag_filter_matches_the_whole_tag_not_a_substring(self):
+        """The same hard line ``--neighborhood`` draws. ``--tag cof`` must not
+        quietly list every coffee place, and ``--tag coffeehouse`` must not
+        match ``coffee`` from the other direction."""
+        for typed in ("cof", "coffeehouse", "offe"):
+            with self.subTest(typed=typed):
+                out, err = self.run_todo("--tag", typed)
+
+                self.assertNotIn("Blue Bottle", out)
+                self.assertNotIn("Sightglass Wish", out)
+                self.assertIn("filter", out.lower())
+
+    def test_the_tag_filter_strips_surrounding_whitespace(self):
+        """The ``NOCASE`` collation folds case but does not strip, which is
+        why the normalizer runs at the entry point."""
+        out, err = self.run_todo("--tag", "  coffee  ")
+
+        self.assertIn("Blue Bottle", out)
+
     def test_neighborhood_lists_only_places_in_that_neighborhood(self):
         out, err = self.run_todo("--neighborhood", "Mission")
 
@@ -3920,6 +3992,14 @@ class TodoCommandFilterTests(TodoCommandTestCase):
                 out, err = self.run_todo("--neighborhood", typed)
 
                 self.assertIn("Blue Bottle", out)
+
+    def test_the_neighborhood_filter_strips_surrounding_whitespace(self):
+        """``__iexact`` folds case but matches the value verbatim otherwise,
+        so the padding has to come off before the filter is built."""
+        out, err = self.run_todo("--neighborhood", "  Mission  ")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Ramen Shop", out)
 
     def test_the_neighborhood_filter_matches_the_whole_value_not_a_substring(self):
         """Partial neighborhood matching is ``find``'s job, deliberately."""
