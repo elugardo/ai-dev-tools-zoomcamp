@@ -3,6 +3,7 @@ import unittest
 from django.apps import apps
 from django.core.exceptions import ValidationError
 from django.db import IntegrityError, transaction
+from django.db.models import Q
 from django.test import SimpleTestCase, TestCase
 
 from places.models import Place, Tag, normalize_tag_name
@@ -75,6 +76,13 @@ class TagModelTests(TestCase):
             list(Tag.objects.exclude(name="Coffee").values_list("name", flat=True)),
             ["ramen"],
         )
+
+    def test_a_q_object_lookup_finds_the_existing_row(self):
+        """Q objects bypass any manager-level kwarg rewriting -- the column
+        collation is what has to carry case-insensitivity here."""
+        existing = Tag.objects.create(name="coffee")
+        self.assertEqual(Tag.objects.filter(Q(name="Coffee")).count(), 1)
+        self.assertEqual(Tag.objects.get(Q(name="COFFEE")).pk, existing.pk)
 
     def test_a_genuine_duplicate_still_violates_the_unique_constraint(self):
         Tag.objects.create(name="coffee")
@@ -181,6 +189,28 @@ class PlaceModelTests(TestCase):
 
         self.assertEqual(tag.places.count(), 2)
         self.assertEqual(Tag.objects.count(), 1)
+
+    def test_filtering_places_by_tag_name_is_case_insensitive(self):
+        """How issue #6's --tag filter and issue #7's todo --tag will be
+        written. Place.objects is a plain manager, so nothing rewrites the
+        lookup -- it has to work at the database level."""
+        tag = Tag.objects.create(name="coffee")
+        place = Place.objects.create(name="Bar Alto")
+        place.tags.add(tag)
+
+        for query in ("coffee", "Coffee", "COFFEE", "CoFfEe"):
+            with self.subTest(query=query):
+                self.assertEqual(
+                    list(Place.objects.filter(tags__name=query)), [place]
+                )
+
+    def test_traversing_from_a_place_to_its_tags_is_case_insensitive(self):
+        tag = Tag.objects.create(name="coffee")
+        place = Place.objects.create(name="Bar Alto")
+        place.tags.add(tag)
+
+        self.assertEqual(place.tags.filter(name="Coffee").count(), 1)
+        self.assertEqual(place.tags.get(Q(name="COFFEE")).pk, tag.pk)
 
     def test_str_starts_with_the_name(self):
         place = Place.objects.create(name="Bar Alto", neighborhood="Chamberi")

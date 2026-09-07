@@ -3,86 +3,45 @@
 Two models live here and nothing else. ``Tag`` is a lowercase-only label;
 ``Place`` is the journal entry itself.
 
-Tags are case-insensitive **end to end**. :func:`normalize_tag_name` is the one
-place that decides what a tag name really is, and both the write path
-(``Tag.save``) and the read path (``Tag.objects`` lookups) run every name
-through it. Later commands should call it rather than lowercasing by hand.
+Tags are case-insensitive **end to end**, and that is enforced in one place:
+``Tag.name`` carries the ``NOCASE`` collation, so SQLite compares the column
+case-insensitively for *every* query -- direct manager lookups, ``Q`` objects,
+relation traversals like ``Place.objects.filter(tags__name="Coffee")``, and the
+unique constraint itself. A caller cannot write a lookup that quietly misses a
+stored tag because of case.
+
+Names are still *stored* lowercase: :func:`normalize_tag_name` is the canonical
+form and runs on every write, so ``str(tag)``, admin lists and command output
+are always ``coffee``. Callers should still run untrusted input through
+``normalize_tag_name`` -- it also strips surrounding whitespace, which the
+collation does not.
 """
 
 from django.core.validators import MaxValueValidator, MinValueValidator
 from django.db import models
 
-#: Lookup suffixes on ``name`` whose right-hand side is a single tag name that
-#: should be normalized before it reaches the database.
-_SINGLE_VALUE_NAME_LOOKUPS = frozenset(
-    {
-        "exact",
-        "iexact",
-        "contains",
-        "icontains",
-        "startswith",
-        "istartswith",
-        "endswith",
-        "iendswith",
-    }
-)
-
-#: Lookup suffixes on ``name`` whose right-hand side is an iterable of names.
-_MULTI_VALUE_NAME_LOOKUPS = frozenset({"in"})
-
 
 def normalize_tag_name(name):
     """Return the canonical stored form of a tag name: stripped and lowercased.
 
-    This is the single source of truth for tag identity. Use it anywhere a tag
-    name arrives from outside the database -- a ``--tag`` flag, a search query,
-    a comparison -- so that ``Coffee``, ``COFFEE`` and ``coffee`` are one tag.
+    This is the single source of truth for what a tag name *is*. Use it
+    wherever a tag name arrives from outside the database -- a ``--tag`` flag,
+    a search query, a comparison -- so that ``Coffee``, ``  COFFEE `` and
+    ``coffee`` all mean the one tag.
     """
     if name is None:
         return ""
     return str(name).strip().lower()
 
 
-def _normalize_name_kwargs(kwargs):
-    """Return ``kwargs`` with any ``name`` lookup normalized."""
-    normalized = {}
-    for key, value in kwargs.items():
-        field, _, lookup = key.partition("__")
-        if field != "name":
-            normalized[key] = value
-            continue
-        lookup = lookup or "exact"
-        if lookup in _SINGLE_VALUE_NAME_LOOKUPS:
-            normalized[key] = normalize_tag_name(value)
-        elif lookup in _MULTI_VALUE_NAME_LOOKUPS:
-            normalized[key] = [normalize_tag_name(item) for item in value]
-        else:
-            normalized[key] = value
-    return normalized
-
-
-class TagQuerySet(models.QuerySet):
-    """Queryset that lowercases tag names on the way *in* to a query.
-
-    Normalizing only on save is not enough: ``get_or_create(name="Coffee")``
-    would miss the stored ``coffee``, try to insert, and die on the unique
-    constraint. ``get``, ``get_or_create`` and ``update_or_create`` all route
-    through ``filter``/``exclude``, so normalizing here covers every read path.
-    """
-
-    def filter(self, *args, **kwargs):
-        return super().filter(*args, **_normalize_name_kwargs(kwargs))
-
-    def exclude(self, *args, **kwargs):
-        return super().exclude(*args, **_normalize_name_kwargs(kwargs))
-
-
 class Tag(models.Model):
     """A lowercase label attached to places: ``coffee``, ``ramen``, ``wifi``."""
 
-    name = models.CharField(max_length=50, unique=True)
-
-    objects = TagQuerySet.as_manager()
+    #: ``db_collation="NOCASE"`` makes SQLite compare this column without
+    #: regard to case, on every query path and in the unique index. It is what
+    #: keeps ``Place.objects.filter(tags__name="Coffee")`` working even though
+    #: ``Place.objects`` knows nothing about tag normalization.
+    name = models.CharField(max_length=50, unique=True, db_collation="NOCASE")
 
     class Meta:
         ordering = ["name"]
@@ -93,8 +52,9 @@ class Tag(models.Model):
     def clean(self):
         """Normalize before ``full_clean`` checks uniqueness.
 
-        Without this, validating ``Coffee`` while ``coffee`` is stored would
-        pass validation and then fail on the database constraint.
+        Keeps validation and the database agreeing on what the stored name
+        will be, so the admin reports a duplicate rather than exploding on the
+        constraint after validation passed.
         """
         super().clean()
         self.name = normalize_tag_name(self.name)
