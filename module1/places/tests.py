@@ -2230,6 +2230,35 @@ class FindCommandLimitTests(FindCommandTestCase):
         self.assertEqual(len(self.result_lines(out)), 4)
         self.assertNotIn("No strong match", out)
 
+    def test_a_limit_below_three_narrows_the_weak_match_fallback_too(self):
+        """``--limit`` never *widens* the fallback -- that is the ranker's
+        cap -- but it does narrow it, and the header names what was printed
+        rather than the cap it did not reach.
+
+        This is a design decision rather than an acceptance criterion: leaving
+        the fallback pinned at 3 whatever ``--limit`` says would still be
+        criteria-compliant, which is exactly why it needs a test of its own.
+        """
+        for limit, expected_header in ((1, "Closest 1:"), (2, "Closest 2:")):
+            with self.subTest(limit=limit):
+                Place.objects.all().delete()
+                self.populate(6)
+
+                out, err = self.run_find("qqqqqq", "--limit", str(limit))
+
+                self.assertIn("No strong match. " + expected_header, out)
+                self.assertEqual(len(self.result_lines(out)), limit)
+
+    def test_a_narrowed_fallback_header_never_names_a_count_it_did_not_print(self):
+        """The header and the line count are the same number, always."""
+        self.populate(5)
+
+        out, err = self.run_find("qqqqqq", "--limit", "1")
+
+        self.assertNotIn("Closest 3", out)
+        self.assertNotIn("Closest 2", out)
+        self.assertEqual(len(self.result_lines(out)), 1)
+
     def test_a_zero_or_negative_limit_is_rejected_by_name(self):
         self.populate(4)
 
