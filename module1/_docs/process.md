@@ -41,12 +41,64 @@ name.
 An issue is closed only after QA returns PASS. A FAIL goes back to the engineer,
 who fixes it on the same branch; the cycle repeats until it passes.
 
+## The orchestrator
+
+The main session is the orchestrator. It launches the PM, the engineer and QA as
+subagents. It does not groom, implement or test itself.
+
+### Lifecycle
+
+1. Pick the next open issue from the backlog
+2. PM grooms it
+3. Engineer implements it
+4. QA verifies it
+5. On FAIL, back to step 3 with the QA comment as input
+6. On PASS, close the issue
+7. Repeat until the backlog is empty
+
+### Rules
+
+- Do not skip step 2
+- The engineer does not close the issue
+- QA does not fix the code, only outputs PASS or FAIL
+- The orchestrator closes the issue only after QA outputs PASS
+
+### Why the roles are separate
+
+The work moves through a graph whose nodes are specialised agents, with one
+conditional edge — QA's verdict either ends the task or sends it back:
+
+```
+  PM ──▶ Engineer ──▶ QA ──PASS──▶ done
+              ▲        │
+              └──FAIL──┘
+```
+
+Separating the roles buys independence, not ceremony. The engineer writes tests
+that pass, which is not the same as meeting the criteria: on issue #2 the suite
+was green at 32 tests while `Place.objects.filter(tags__name="Coffee")` silently
+returned nothing, and a later QA pass found five criteria that the code satisfied
+but no test pinned. A fresh reader checking the issue rather than the diff is
+what caught both.
+
+It costs more time and more tokens than simply asking an engineer to build the
+thing. Spend it where a silent wrong answer is expensive, and skip it where it
+is not.
+
 ## Order and dependencies
 
-Issue #1 unblocks everything: until `places` is in `INSTALLED_APPS` and migrated,
-Django cannot see models, commands, or tests. #2 (models) blocks #3, #4, #6–#9.
-#5 (the ranking module) blocks #6. Otherwise tasks are independent and can be
-done in any order.
+**#1 and #2 are done and merged.** `places` is registered and migrated, and the
+`Place` and `Tag` models exist, so nothing in the backlog is blocked on the
+schema any more.
+
+What remains: #5 (the ranking module) blocks #6 (`find`). #10 (README) is last,
+since it documents every command. #3, #4, #7, #8 and #9 are independent of each
+other and can be done in any order.
+
+Tag lookups are case-insensitive at the database level, so `--tag Coffee` matches
+a stored `coffee` on every query path. Whitespace is *not* handled by that — run
+user input through `normalize_tag_name()` from `places.models` at the entry
+point, which strips as well as lowercases.
 
 ## When the plan is wrong
 
