@@ -20,6 +20,7 @@ from django.db.models import Q
 from django.test import SimpleTestCase, TestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
+from django.utils import timezone as django_timezone
 
 from places import search
 from places.models import Place, Tag, normalize_tag_name
@@ -2661,3 +2662,1431 @@ class FindCommandQueryCountTests(FindCommandTestCase):
             self.run_find("coffee", "--tag", "Coffee", "--status", "wishlist")
 
         self.assertLess(len(captured), Place.objects.count())
+
+
+# ---------------------------------------------------------------------------
+# The wishlist loop: `places/lookup.py`, `todo` and `visit` (issue #7)
+#
+# `visit` is the only thing in the tool that ever writes `last_visited_at`.
+# Name resolution is shared between the two commands and tested on its own
+# first, without a command in the way.
+# ---------------------------------------------------------------------------
+
+
+def _lookup_module():
+    """The shared name-resolution module."""
+    from places import lookup as lookup_module
+
+    return lookup_module
+
+
+def _visit_module():
+    """The ``visit`` command module, imported the way Django finds it."""
+    from places.management.commands import visit as visit_module
+
+    return visit_module
+
+
+def _todo_module():
+    """The ``todo`` command module, imported the way Django finds it."""
+    from places.management.commands import todo as todo_module
+
+    return todo_module
+
+
+def _imported_modules(module):
+    """Every module name ``module`` imports, from its source.
+
+    Imports rather than a grep over the text, because the text includes
+    docstrings: a module that *names* the ranker to explain why it must not
+    use it is exactly right, and a substring search would call that a
+    violation.
+    """
+    imported = set()
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    return imported
+
+
+def _called_names(module):
+    """Every function name ``module`` calls -- ``foo()`` and ``bar.foo()``."""
+    called = set()
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                called.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                called.add(node.func.attr)
+    return called
+
+
+def _dotted_calls(module):
+    """Every ``name.attribute()`` call in ``module``, as ``"name.attribute"``."""
+    calls = set()
+    for node in ast.walk(ast.parse(inspect.getsource(module))):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+        ):
+            calls.add(f"{node.func.value.id}.{node.func.attr}")
+    return calls
+
+
+class LookupModuleContractTests(SimpleTestCase):
+    """What the shared module must be, before what it must do.
+
+    Issue #7 asks for one statement of the resolution rule that both commands
+    import, importable without a command and independent of the ranker.
+    """
+
+    def test_the_helper_is_importable_without_touching_a_command(self):
+        lookup = _lookup_module()
+
+        for name in ("resolve_place", "normalize_place_name", "describe_place"):
+            with self.subTest(name=name):
+                self.assertTrue(callable(getattr(lookup, name)))
+
+    def test_the_helper_is_not_called_search(self):
+        """``places/search.py`` is the ranking module (issue #5); the resolver
+        may not squat on that name."""
+        self.assertNotEqual(_lookup_module().__name__, "places.search")
+
+    def test_the_helper_does_not_import_the_ranker_or_any_command(self):
+        for module in _imported_modules(_lookup_module()):
+            with self.subTest(module=module):
+                self.assertFalse(
+                    module == "places.search"
+                    or module.startswith("rapidfuzz")
+                    or module.startswith("places.management"),
+                    f"the resolver must stay independent but imports {module}",
+                )
+
+    def test_the_helper_calls_nothing_from_the_ranker(self):
+        self.assertNotIn("rank_places", _called_names(_lookup_module()))
+
+    def test_both_commands_import_the_shared_module_rather_than_copying_it(self):
+        for module in (_visit_module(), _todo_module()):
+            with self.subTest(module=module.__name__):
+                source = inspect.getsource(module)
+
+                self.assertIn("places.lookup", source)
+
+    def test_neither_command_reimplements_name_matching(self):
+        """``visit`` resolves through the helper; the lookups themselves must
+        not be spelled out a second time in the command."""
+        source = inspect.getsource(_visit_module())
+
+        self.assertIn("resolve_place", source)
+        self.assertNotIn("name__iexact", source)
+        self.assertNotIn("name__icontains", source)
+
+
+class ResolvePlaceTests(TestCase):
+    """The rule itself, exercised directly -- no command, no ``call_command``."""
+
+    def setUp(self):
+        self.lookup = _lookup_module()
+
+    def make_place(self, name, tags=(), **fields):
+        place = Place.objects.create(name=name, **fields)
+        for tag_name in tags:
+            place.tags.add(Tag.objects.get_or_create(name=tag_name)[0])
+        return place
+
+    def resolve(self, name):
+        return self.lookup.resolve_place(name)
+
+    def test_an_exact_name_resolves(self):
+        place = self.make_place("Blue Bottle")
+
+        self.assertEqual(self.resolve("Blue Bottle").pk, place.pk)
+
+    def test_resolution_is_case_insensitive(self):
+        place = self.make_place("Blue Bottle")
+
+        for typed in ("blue bottle", "BLUE BOTTLE", "bLuE bOtTlE"):
+            with self.subTest(typed=typed):
+                self.assertEqual(self.resolve(typed).pk, place.pk)
+
+    def test_surrounding_whitespace_on_the_argument_is_ignored(self):
+        place = self.make_place("Blue Bottle")
+
+        self.assertEqual(self.resolve("  Blue Bottle  ").pk, place.pk)
+
+    def test_a_substring_resolves_when_no_whole_name_matches(self):
+        place = self.make_place("Blue Bottle Coffee")
+
+        self.assertEqual(self.resolve("bottle").pk, place.pk)
+
+    def test_the_whole_name_wins_over_a_longer_place_containing_it(self):
+        """The case the two stages exist for: ``Blue Bottle`` is not ambiguous
+        just because ``Blue Bottle Coffee`` is also stored."""
+        exact = self.make_place("Blue Bottle")
+        self.make_place("Blue Bottle Coffee")
+
+        self.assertEqual(self.resolve("Blue Bottle").pk, exact.pk)
+
+    def test_the_whole_name_wins_case_insensitively_too(self):
+        exact = self.make_place("Blue Bottle")
+        self.make_place("Blue Bottle Coffee")
+
+        self.assertEqual(self.resolve("blue bottle").pk, exact.pk)
+
+    def test_a_substring_matching_two_places_is_ambiguous(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Blue Bottle Coffee")
+
+        with self.assertRaises(self.lookup.AmbiguousPlaceName) as caught:
+            self.resolve("Blue")
+
+        self.assertIn("Blue Bottle", str(caught.exception))
+        self.assertIn("Blue Bottle Coffee", str(caught.exception))
+
+    def test_two_names_differing_only_by_case_are_ambiguous_at_stage_one(self):
+        """Neither is more exact than the other, so the resolver must not pick."""
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("blue bottle", neighborhood="SoMa")
+
+        with self.assertRaises(self.lookup.AmbiguousPlaceName) as caught:
+            self.resolve("Blue Bottle")
+
+        message = str(caught.exception)
+        self.assertIn("Mission", message)
+        self.assertIn("SoMa", message)
+
+    def test_an_ambiguous_error_carries_every_candidate(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Blue Bottle Coffee")
+
+        with self.assertRaises(self.lookup.AmbiguousPlaceName) as caught:
+            self.resolve("Blue")
+
+        self.assertEqual(len(caught.exception.candidates), 2)
+
+    def test_the_candidate_list_prints_one_place_per_line_with_status(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place(
+            "Blue Bottle Coffee",
+            neighborhood="SoMa",
+            status=Place.Status.VISITED,
+        )
+
+        with self.assertRaises(self.lookup.AmbiguousPlaceName) as caught:
+            self.resolve("Blue")
+
+        candidate_lines = [
+            line
+            for line in str(caught.exception).splitlines()
+            if "Blue Bottle" in line
+        ]
+        self.assertEqual(len(candidate_lines), 2)
+        self.assertIn(Place.Status.WISHLIST.value, candidate_lines[0])
+        self.assertIn(Place.Status.VISITED.value, candidate_lines[1])
+
+    def test_the_candidate_order_is_stable_across_calls(self):
+        for name in ("Zoo Cafe", "abc Cafe", "Mid Cafe"):
+            self.make_place(name)
+
+        orders = []
+        for _ in range(3):
+            with self.assertRaises(self.lookup.AmbiguousPlaceName) as caught:
+                self.resolve("Cafe")
+            orders.append([place.name for place in caught.exception.candidates])
+
+        self.assertEqual(orders[0], orders[1])
+        self.assertEqual(orders[1], orders[2])
+        self.assertEqual(orders[0], ["abc Cafe", "Mid Cafe", "Zoo Cafe"])
+
+    def test_a_name_matching_nothing_raises_and_names_the_string(self):
+        self.make_place("Blue Bottle")
+
+        with self.assertRaises(self.lookup.PlaceNotFound) as caught:
+            self.resolve("Nowhere Cafe")
+
+        self.assertIn("Nowhere Cafe", str(caught.exception))
+
+    def test_the_not_found_message_points_at_a_next_step(self):
+        with self.assertRaises(self.lookup.PlaceNotFound) as caught:
+            self.resolve("Nowhere Cafe")
+
+        message = str(caught.exception)
+        self.assertTrue(
+            "add" in message or "find" in message,
+            f"expected a suggested next step in: {message!r}",
+        )
+
+    def test_an_empty_or_whitespace_name_is_rejected_on_its_own(self):
+        self.make_place("Blue Bottle")
+
+        for typed in ("", "   ", "\t\n", None):
+            with self.subTest(typed=repr(typed)):
+                with self.assertRaises(self.lookup.EmptyPlaceName):
+                    self.resolve(typed)
+
+    def test_an_empty_name_does_not_fall_through_to_matching_everything(self):
+        """``""`` is a substring of every name; stage 2 must never see it."""
+        self.make_place("Blue Bottle")
+        self.make_place("Tartine")
+
+        with self.assertRaises(self.lookup.PlaceNameError) as caught:
+            self.resolve("")
+
+        self.assertEqual(caught.exception.candidates, [])
+
+    def test_resolution_finds_an_already_visited_place(self):
+        """Every place is in scope, not just the wishlist, so a place can be
+        visited a second time."""
+        place = self.make_place("Blue Bottle", status=Place.Status.VISITED)
+
+        self.assertEqual(self.resolve("Blue Bottle").pk, place.pk)
+
+    def test_resolution_matches_on_the_name_and_nothing_else(self):
+        self.make_place(
+            "Blue Bottle",
+            neighborhood="Mission",
+            note="the best cortado in town",
+            tags=["coffee"],
+        )
+
+        for typed in ("Mission", "cortado", "coffee"):
+            with self.subTest(typed=typed):
+                with self.assertRaises(self.lookup.PlaceNotFound):
+                    self.resolve(typed)
+
+    def test_resolution_does_no_fuzzy_matching(self):
+        """A typo is a miss here. Typo tolerance belongs to ``find``."""
+        self.make_place("Blue Bottle")
+
+        for typo in ("Blu Bottel", "Bleu Bottle", "Blue Botle"):
+            with self.subTest(typo=typo):
+                with self.assertRaises(self.lookup.PlaceNotFound):
+                    self.resolve(typo)
+
+    def test_resolution_writes_nothing(self):
+        place = self.make_place("Blue Bottle")
+        before = Place.objects.values_list("name", "status", "last_visited_at")[0]
+
+        self.resolve("Blue Bottle")
+
+        self.assertEqual(
+            Place.objects.values_list("name", "status", "last_visited_at")[0], before
+        )
+        self.assertIsNone(Place.objects.get(pk=place.pk).last_visited_at)
+
+    def test_a_narrower_queryset_can_be_passed_in(self):
+        """The default is every place; the argument exists so a caller with a
+        reason can narrow it, and ``visit`` deliberately has no such reason."""
+        self.make_place("Blue Bottle", status=Place.Status.VISITED)
+
+        with self.assertRaises(self.lookup.PlaceNotFound):
+            self.lookup.resolve_place(
+                "Blue Bottle",
+                Place.objects.filter(status=Place.Status.WISHLIST),
+            )
+
+
+class DescribePlaceTests(TestCase):
+    """The one-line description both commands print."""
+
+    def setUp(self):
+        self.lookup = _lookup_module()
+
+    def test_a_bare_name_renders_as_a_bare_name(self):
+        place = Place.objects.create(name="Tartine")
+
+        line = self.lookup.describe_place(place, status=False)
+
+        self.assertEqual(line, "Tartine")
+
+    def test_nothing_missing_renders_as_none_or_an_empty_bracket(self):
+        place = Place.objects.create(name="Tartine")
+
+        line = self.lookup.describe_place(place, status=False, tags=[])
+
+        self.assertNotIn("None", line)
+        self.assertNotIn("[]", line)
+        self.assertNotIn("()", line)
+        self.assertFalse(line.endswith("-"))
+
+    def test_present_fields_all_appear(self):
+        place = Place.objects.create(
+            name="Blue Bottle", neighborhood="Mission", note="good wifi"
+        )
+
+        line = self.lookup.describe_place(place, tags=["coffee"])
+
+        for expected in ("Blue Bottle", "Mission", "good wifi", "coffee"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, line)
+        self.assertIn(Place.Status.WISHLIST.value, line)
+
+    def test_a_long_note_is_cut_to_one_bounded_line(self):
+        place = Place.objects.create(name="Tartine", note="word " * 200)
+
+        line = self.lookup.describe_place(place, status=False)
+
+        self.assertLess(len(line), 200)
+        self.assertIn(self.lookup.TRUNCATION_MARKER, line)
+
+    def test_a_multi_line_note_stays_on_one_line(self):
+        place = Place.objects.create(name="Tartine", note="first\nsecond\nthird")
+
+        line = self.lookup.describe_place(place, status=False)
+
+        self.assertNotIn("\n", line)
+
+
+# ---------------------------------------------------------------------------
+# `visit`
+# ---------------------------------------------------------------------------
+
+
+class VisitCommandDiscoveryTests(SimpleTestCase):
+    """The command is discoverable and takes the documented flags."""
+
+    def parser(self):
+        return load_command_class("places", "visit").create_parser("manage.py", "visit")
+
+    def test_visit_is_registered_as_a_command_of_the_places_app(self):
+        self.assertEqual(get_commands().get("visit"), "places")
+
+    def test_help_documents_the_positional_name_and_every_flag(self):
+        help_text = self.parser().format_help()
+
+        self.assertIn("name", help_text)
+        for flag in ("--note", "--rating"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+    def test_note_and_rating_default_to_none_so_omitting_them_is_detectable(self):
+        """``--note ""`` clears the note; omitting ``--note`` leaves it alone.
+        A default of ``""`` would make those two indistinguishable."""
+        parsed = self.parser().parse_args(["Blue Bottle"])
+
+        self.assertIsNone(parsed.note)
+        self.assertIsNone(parsed.rating)
+
+    def test_the_rating_flag_takes_a_whole_number(self):
+        self.assertEqual(
+            self.parser().parse_args(["Blue Bottle", "--rating", "4"]).rating, 4
+        )
+
+    def test_there_is_no_status_flag_because_visit_always_means_visited(self):
+        help_text = self.parser().format_help()
+
+        self.assertNotIn("--status", help_text)
+        self.assertNotIn("status", {a.dest for a in self.parser()._actions})
+
+
+class VisitCommandSourceRuleTests(SimpleTestCase):
+    """Rules issue #7 states as a grep over ``visit.py``.
+
+    Each describes a mechanism the command must reuse or refuse rather than a
+    value it prints, and each would survive every behavioral test right up
+    until the day it mattered.
+    """
+
+    def test_visit_stamps_with_djangos_timezone_aware_now(self):
+        """``USE_TZ = True``, so a naive ``datetime.now()`` is a defect."""
+        imported = _imported_modules(_visit_module())
+
+        self.assertIn("django.utils", imported)
+        self.assertNotIn("datetime", imported)
+        self.assertIn("timezone.now", _dotted_calls(_visit_module()))
+
+    def test_visit_imports_nothing_from_the_ranker(self):
+        for module in _imported_modules(_visit_module()):
+            with self.subTest(module=module):
+                self.assertFalse(
+                    module == "places.search" or module.startswith("rapidfuzz"),
+                    f"visit must not depend on the ranker but imports {module}",
+                )
+        self.assertNotIn("rank_places", _called_names(_visit_module()))
+
+    def test_visit_never_prompts(self):
+        """A prompt would hang under ``call_command`` and in any script."""
+        called = _called_names(_visit_module())
+
+        self.assertNotIn("input", called)
+        self.assertNotIn("getpass", _imported_modules(_visit_module()))
+
+    def test_visit_refers_to_the_status_choices_class_not_to_string_literals(self):
+        source = inspect.getsource(_visit_module())
+
+        self.assertNotIn('"%s"' % Place.Status.VISITED.value, source)
+        self.assertIn("Place.Status", source)
+
+
+class VisitCommandTestCase(TestCase):
+    """Shared plumbing: run ``visit`` through ``call_command``, per
+    ``_docs/testing-guidelines.md``. Nothing here shells out."""
+
+    def make_place(self, name, tags=(), **fields):
+        place = Place.objects.create(name=name, **fields)
+        for tag_name in tags:
+            place.tags.add(Tag.objects.get_or_create(name=tag_name)[0])
+        return place
+
+    def run_visit(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("visit", *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def run_visit_from_command_line(self, *args):
+        """Drive ``visit`` the way ``manage.py`` does, so exit codes are real.
+
+        See ``AddCommandTestCase.run_add_from_command_line``: setting
+        ``_called_from_command_line`` is what lets argparse's own exit status
+        surface without shelling out to ``manage.py``.
+        """
+        command = load_command_class("places", "visit")
+        command._called_from_command_line = True
+        out, err = StringIO(), StringIO()
+        call_command(command, *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def snapshot(self):
+        """Every field ``visit`` could write, for every place in the journal."""
+        return sorted(
+            Place.objects.values_list(
+                "pk", "name", "status", "last_visited_at", "note", "rating"
+            )
+        )
+
+    def assert_rejected(self, *args):
+        """Run a ``visit`` that must fail, and prove nothing was written.
+
+        Returns the ``CommandError`` -- rendered by ``manage.py`` as a one-line
+        message on stderr with a non-zero exit -- after checking that no
+        place's status, timestamp, note or rating moved.
+        """
+        before = self.snapshot()
+        out = StringIO()
+        with self.assertRaises(CommandError) as caught:
+            call_command("visit", *args, stdout=out)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(out.getvalue(), "")
+        return caught.exception
+
+
+class VisitCommandFlipTests(VisitCommandTestCase):
+    """The plain flip: wishlist to visited, stamped."""
+
+    def test_a_wishlist_place_becomes_visited(self):
+        place = self.make_place("Blue Bottle")
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.VISITED)
+
+    def test_the_visit_is_stamped_with_an_aware_time_close_to_now(self):
+        place = self.make_place("Blue Bottle")
+        before = django_timezone.now()
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertIsNotNone(place.last_visited_at)
+        self.assertIsNotNone(place.last_visited_at.tzinfo)
+        self.assertGreaterEqual(place.last_visited_at, before)
+        self.assertLess(
+            (django_timezone.now() - place.last_visited_at).total_seconds(), 10
+        )
+
+    def test_stamping_raises_no_naive_datetime_warning(self):
+        """A naive datetime under ``USE_TZ = True`` is a ``RuntimeWarning``."""
+        self.make_place("Blue Bottle")
+
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            self.run_visit("Blue Bottle")
+
+        self.assertEqual(
+            [w for w in caught if issubclass(w.category, RuntimeWarning)], []
+        )
+
+    def test_the_confirmation_names_the_place_and_its_new_status(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, err = self.run_visit("Blue Bottle")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertIn(Place.Status.VISITED.value, out)
+
+    def test_a_successful_visit_writes_nothing_to_stderr(self):
+        self.make_place("Blue Bottle")
+
+        out, err = self.run_visit("Blue Bottle")
+
+        self.assertEqual(err, "")
+
+    def test_no_flags_is_the_normal_case_and_leaves_note_and_rating_alone(self):
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.VISITED)
+        self.assertIsNotNone(place.last_visited_at)
+        self.assertEqual(place.note, "heard good things")
+        self.assertIsNone(place.rating)
+
+    def test_status_flips_even_when_only_a_note_is_given(self):
+        """Unlike ``add``, ``visit`` never infers status from a rating."""
+        place = self.make_place("Blue Bottle")
+
+        self.run_visit("Blue Bottle", "--note", "great cortado")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.VISITED)
+        self.assertIsNotNone(place.last_visited_at)
+
+    def test_visit_leaves_every_other_field_untouched(self):
+        place = self.make_place(
+            "Blue Bottle",
+            tags=["coffee", "wifi"],
+            neighborhood="Mission",
+            address="315 Linden St",
+        )
+        created_at = place.created_at
+
+        self.run_visit("Blue Bottle", "--note", "great cortado", "--rating", "4")
+
+        place.refresh_from_db()
+        self.assertEqual(place.name, "Blue Bottle")
+        self.assertEqual(place.neighborhood, "Mission")
+        self.assertEqual(place.address, "315 Linden St")
+        self.assertEqual(place.created_at, created_at)
+        self.assertEqual(
+            sorted(tag.name for tag in place.tags.all()), ["coffee", "wifi"]
+        )
+
+    def test_the_write_names_the_fields_it_touches_rather_than_saving_the_row(self):
+        """A narrow ``update_fields`` write, pinned where it can actually fail.
+
+        The test above passes under a bare ``place.save()`` too, because
+        nothing else has changed on the in-memory instance for a full save to
+        carry into the database. So dirty a second field on the instance the
+        command is about to save -- exactly what a future bug, or a model with
+        a ``save()`` of its own, would do -- and check the database refused it.
+        """
+        place = self.make_place(
+            "Blue Bottle", neighborhood="Mission", note="heard good things"
+        )
+        resolve_place = _lookup_module().resolve_place
+
+        def resolve_and_dirty(*args, **kwargs):
+            resolved = resolve_place(*args, **kwargs)
+            resolved.name = "Somewhere Else"
+            resolved.neighborhood = "Nowhere"
+            return resolved
+
+        with mock.patch(
+            "places.management.commands.visit.resolve_place",
+            side_effect=resolve_and_dirty,
+        ):
+            self.run_visit("Blue Bottle", "--note", "great cortado")
+
+        place.refresh_from_db()
+        self.assertEqual(place.name, "Blue Bottle")
+        self.assertEqual(place.neighborhood, "Mission")
+        # ...while the fields `visit` does own were written.
+        self.assertEqual(place.status, Place.Status.VISITED)
+        self.assertEqual(place.note, "great cortado")
+        self.assertIsNotNone(place.last_visited_at)
+
+
+class VisitCommandResolutionTests(VisitCommandTestCase):
+    """The resolution rule, seen from the command."""
+
+    def test_a_place_resolves_whatever_case_the_name_is_typed_in(self):
+        for typed in ("blue bottle", "BLUE BOTTLE"):
+            with self.subTest(typed=typed):
+                place = self.make_place("Blue Bottle")
+
+                self.run_visit(typed)
+
+                place.refresh_from_db()
+                self.assertEqual(place.status, Place.Status.VISITED)
+                place.delete()
+
+    def test_surrounding_whitespace_resolves_the_same_place(self):
+        place = self.make_place("Blue Bottle")
+
+        self.run_visit("  Blue Bottle  ")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.VISITED)
+
+    def test_the_whole_name_beats_a_longer_place_containing_it(self):
+        exact = self.make_place("Blue Bottle")
+        longer = self.make_place("Blue Bottle Coffee")
+
+        self.run_visit("Blue Bottle")
+
+        exact.refresh_from_db()
+        longer.refresh_from_db()
+        self.assertEqual(exact.status, Place.Status.VISITED)
+        self.assertEqual(longer.status, Place.Status.WISHLIST)
+        self.assertIsNone(longer.last_visited_at)
+
+    def test_a_substring_resolves_when_nothing_matches_the_whole_name(self):
+        place = self.make_place("Blue Bottle Coffee")
+
+        self.run_visit("bottle coffee")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.VISITED)
+
+    def test_an_unknown_name_is_rejected_and_names_the_string(self):
+        self.make_place("Blue Bottle")
+
+        error = self.assert_rejected("Nowhere Cafe")
+
+        self.assertIn("Nowhere Cafe", str(error))
+
+    def test_an_unknown_name_exits_non_zero(self):
+        error = self.assert_rejected("Nowhere Cafe")
+
+        self.assertNotEqual(error.returncode, 0)
+
+    def test_an_ambiguous_name_lists_every_candidate_and_writes_nothing(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Blue Bottle Coffee", neighborhood="SoMa")
+
+        error = self.assert_rejected("Blue")
+
+        message = str(error)
+        self.assertIn("Blue Bottle", message)
+        self.assertIn("Blue Bottle Coffee", message)
+        self.assertIn("Mission", message)
+        self.assertIn("SoMa", message)
+        self.assertEqual(
+            list(Place.objects.values_list("status", flat=True)),
+            [Place.Status.WISHLIST, Place.Status.WISHLIST],
+        )
+
+    def test_an_ambiguous_name_exits_non_zero(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Blue Bottle Coffee")
+
+        error = self.assert_rejected("Blue")
+
+        self.assertNotEqual(error.returncode, 0)
+
+    def test_names_differing_only_by_case_are_reported_not_guessed_between(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("blue bottle", neighborhood="SoMa")
+
+        error = self.assert_rejected("BLUE BOTTLE")
+
+        self.assertIn("Mission", str(error))
+        self.assertIn("SoMa", str(error))
+
+    def test_an_empty_name_is_rejected_and_visits_nothing(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Tartine")
+
+        for typed in ("", "   "):
+            with self.subTest(typed=repr(typed)):
+                self.assert_rejected(typed)
+
+                self.assertEqual(
+                    Place.objects.filter(status=Place.Status.VISITED).count(), 0
+                )
+                self.assertEqual(
+                    Place.objects.filter(last_visited_at__isnull=False).count(), 0
+                )
+
+    def test_a_typo_is_a_miss_rather_than_a_guess(self):
+        self.make_place("Blue Bottle")
+
+        self.assert_rejected("Blu Bottel")
+
+    def test_an_already_visited_place_is_still_resolvable(self):
+        place = self.make_place("Blue Bottle", status=Place.Status.VISITED)
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertIsNotNone(place.last_visited_at)
+
+
+class VisitCommandNoteAndRatingTests(VisitCommandTestCase):
+    """``--note`` and ``--rating`` replace, and only when passed."""
+
+    def test_a_note_is_stored(self):
+        place = self.make_place("Blue Bottle")
+
+        self.run_visit("Blue Bottle", "--note", "great cortado")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "great cortado")
+
+    def test_a_note_replaces_rather_than_appends(self):
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.run_visit("Blue Bottle", "--note", "great cortado")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "great cortado")
+        self.assertNotIn("heard good things", place.note)
+
+    def test_an_explicit_empty_note_clears_the_note(self):
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.run_visit("Blue Bottle", "--note", "")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "")
+
+    def test_omitting_the_note_flag_leaves_the_note_alone(self):
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.run_visit("Blue Bottle", "--rating", "4")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "heard good things")
+
+    def test_surrounding_whitespace_is_stripped_from_a_note(self):
+        """A note is stored the way ``add`` stores one: stripped."""
+        place = self.make_place("Blue Bottle")
+
+        self.run_visit("Blue Bottle", "--note", "  great cortado  ")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "great cortado")
+
+    def test_a_whitespace_only_note_clears_the_note_like_an_empty_one(self):
+        """Deliberate, and the same rule ``add`` follows: a note of nothing but
+        spaces is a note of nothing."""
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.run_visit("Blue Bottle", "--note", "   ")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "")
+
+    def test_a_rating_is_stored_and_replaces_any_previous_one(self):
+        place = self.make_place("Blue Bottle", rating=2)
+
+        self.run_visit("Blue Bottle", "--rating", "4")
+
+        place.refresh_from_db()
+        self.assertEqual(place.rating, 4)
+
+    def test_omitting_the_rating_flag_leaves_the_rating_alone(self):
+        place = self.make_place("Blue Bottle", rating=2)
+
+        self.run_visit("Blue Bottle", "--note", "still good")
+
+        place.refresh_from_db()
+        self.assertEqual(place.rating, 2)
+
+    def test_the_boundaries_of_the_rating_range_are_accepted(self):
+        for rating in ("1", "5"):
+            with self.subTest(rating=rating):
+                place = self.make_place(f"Place {rating}")
+
+                self.run_visit(f"Place {rating}", "--rating", rating)
+
+                place.refresh_from_db()
+                self.assertEqual(place.rating, int(rating))
+
+
+class VisitCommandRepeatVisitTests(VisitCommandTestCase):
+    """Visiting a visited place again is the point of ``last_visited_at``."""
+
+    OLD_VISIT = datetime(2024, 3, 9, 18, 30, tzinfo=timezone.utc)
+
+    def visited_place(self, **fields):
+        return self.make_place(
+            "Blue Bottle",
+            status=Place.Status.VISITED,
+            last_visited_at=self.OLD_VISIT,
+            **fields,
+        )
+
+    def test_a_repeat_visit_is_allowed_and_does_not_raise(self):
+        self.visited_place()
+
+        out, err = self.run_visit("Blue Bottle")
+
+        self.assertIn("Blue Bottle", out)
+
+    def test_a_repeat_visit_re_stamps_a_strictly_later_time(self):
+        place = self.visited_place()
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertGreater(place.last_visited_at, self.OLD_VISIT)
+
+    def test_a_repeat_visit_leaves_the_status_visited(self):
+        place = self.visited_place()
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.VISITED)
+
+    def test_a_repeat_visit_without_a_note_keeps_the_existing_note(self):
+        place = self.visited_place(note="first time, great cortado")
+
+        self.run_visit("Blue Bottle")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "first time, great cortado")
+
+    def test_a_repeat_visit_with_a_note_overwrites_rather_than_appends(self):
+        place = self.visited_place(note="first time, great cortado")
+
+        self.run_visit("Blue Bottle", "--note", "second time, still good")
+
+        place.refresh_from_db()
+        self.assertEqual(place.note, "second time, still good")
+        self.assertNotIn("first time", place.note)
+
+    def test_the_output_says_the_place_was_already_visited(self):
+        """Overwriting a note must not be a silent surprise."""
+        self.visited_place(note="first time, great cortado")
+
+        out, err = self.run_visit("Blue Bottle", "--note", "second time")
+
+        self.assertIn("already visited", out.lower())
+
+    def test_a_first_visit_does_not_claim_the_place_was_already_visited(self):
+        self.make_place("Tartine")
+
+        out, err = self.run_visit("Tartine")
+
+        self.assertNotIn("already visited", out.lower())
+
+
+class VisitCommandInvalidInputTests(VisitCommandTestCase):
+    """Nothing is written, and the exit code is non-zero."""
+
+    def test_a_rating_outside_one_to_five_names_the_allowed_range(self):
+        self.make_place("Blue Bottle")
+
+        for rating in ("0", "6"):
+            with self.subTest(rating=rating):
+                error = self.assert_rejected("Blue Bottle", "--rating", rating)
+
+                self.assertIn("1", str(error))
+                self.assertIn("5", str(error))
+
+    def test_a_bad_rating_is_caught_before_the_status_is_flipped(self):
+        """Validation runs before the write, so a rejected visit leaves the
+        place on the wishlist with no timestamp."""
+        place = self.make_place("Blue Bottle", note="heard good things")
+
+        self.assert_rejected("Blue Bottle", "--rating", "9", "--note", "great")
+
+        place.refresh_from_db()
+        self.assertEqual(place.status, Place.Status.WISHLIST)
+        self.assertIsNone(place.last_visited_at)
+        self.assertEqual(place.note, "heard good things")
+        self.assertIsNone(place.rating)
+
+    def test_a_bad_rating_leaves_an_already_visited_place_exactly_as_it_was(self):
+        old_visit = datetime(2024, 3, 9, 18, 30, tzinfo=timezone.utc)
+        place = self.make_place(
+            "Blue Bottle",
+            status=Place.Status.VISITED,
+            last_visited_at=old_visit,
+            rating=3,
+        )
+
+        self.assert_rejected("Blue Bottle", "--rating", "0")
+
+        place.refresh_from_db()
+        self.assertEqual(place.last_visited_at, old_visit)
+        self.assertEqual(place.rating, 3)
+
+    def test_argparse_rejects_a_non_integer_rating_before_the_command_body_runs(self):
+        self.make_place("Blue Bottle")
+
+        for rating in ("abc", "4.5"):
+            with self.subTest(rating=rating):
+                with redirect_stderr(StringIO()):
+                    with self.assertRaises(SystemExit) as caught:
+                        self.run_visit_from_command_line(
+                            "Blue Bottle", "--rating", rating
+                        )
+
+                self.assertEqual(caught.exception.code, 2)
+                self.assertEqual(
+                    Place.objects.filter(status=Place.Status.VISITED).count(), 0
+                )
+
+    def test_a_non_integer_rating_raises_rather_than_returning_success(self):
+        """Through ``call_command`` the same usage error is a ``CommandError``."""
+        self.make_place("Blue Bottle")
+
+        with self.assertRaises(CommandError):
+            self.run_visit("Blue Bottle", "--rating", "abc")
+
+        self.assertIsNone(Place.objects.get(name="Blue Bottle").last_visited_at)
+
+
+# ---------------------------------------------------------------------------
+# `todo`
+# ---------------------------------------------------------------------------
+
+
+class TodoCommandDiscoveryTests(SimpleTestCase):
+    """The command is discoverable and takes the documented flags."""
+
+    def parser(self):
+        return load_command_class("places", "todo").create_parser("manage.py", "todo")
+
+    def test_todo_is_registered_as_a_command_of_the_places_app(self):
+        self.assertEqual(get_commands().get("todo"), "places")
+
+    def test_help_documents_both_filters(self):
+        help_text = self.parser().format_help()
+
+        for flag in ("--tag", "--neighborhood"):
+            with self.subTest(flag=flag):
+                self.assertIn(flag, help_text)
+
+    def test_todo_takes_no_positional_argument(self):
+        self.assertEqual(self.parser().parse_args([]).tag, None)
+
+    def test_tag_takes_one_value_per_run_rather_than_accumulating(self):
+        """Repeatable tags with AND/OR semantics is a separate issue."""
+        parsed = self.parser().parse_args(["--tag", "coffee"])
+
+        self.assertEqual(parsed.tag, "coffee")
+
+    def test_the_out_of_scope_flags_are_absent(self):
+        help_text = self.parser().format_help()
+
+        for flag in ("--status", "--limit", "--sort", "--rating"):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, help_text)
+
+
+class TodoCommandSourceRuleTests(SimpleTestCase):
+    """Rules issue #7 states as a grep over ``todo.py``."""
+
+    def test_todo_does_not_hand_roll_tag_normalization(self):
+        source = inspect.getsource(_todo_module())
+
+        self.assertIn("normalize_tag_name", source)
+        self.assertNotIn(".lower()", source)
+
+    def test_todo_orders_in_the_database_rather_than_in_python(self):
+        source = inspect.getsource(_todo_module())
+
+        self.assertIn("order_by", source)
+        self.assertNotIn("sorted(", source)
+        self.assertNotIn(".sort(", source)
+
+    def test_todo_prefetches_the_tags_it_prints(self):
+        source = inspect.getsource(_todo_module())
+
+        self.assertIn('prefetch_related("tags")', source)
+
+
+class TodoCommandTestCase(TestCase):
+    """Shared plumbing: run ``todo`` through ``call_command``."""
+
+    def make_place(self, name, tags=(), created_at=None, **fields):
+        place = Place.objects.create(name=name, **fields)
+        for tag_name in tags:
+            place.tags.add(Tag.objects.get_or_create(name=tag_name)[0])
+        if created_at is not None:
+            # `created_at` is `auto_now_add`, so it ignores a value passed to
+            # `create`; an UPDATE is the only way to pin it.
+            Place.objects.filter(pk=place.pk).update(created_at=created_at)
+            place.refresh_from_db()
+        return place
+
+    def run_todo(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("todo", *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def lines(self, out):
+        return [line for line in out.splitlines() if line.strip()]
+
+    def listed_names(self, out, names):
+        """The given names, in the order their lines appear in ``out``."""
+        found = []
+        for line in self.lines(out):
+            for name in names:
+                if name in line and name not in found:
+                    found.append(name)
+        return found
+
+
+class TodoCommandListingTests(TodoCommandTestCase):
+    """What gets listed, and what does not."""
+
+    def test_every_wishlist_place_is_listed(self):
+        self.make_place("Blue Bottle")
+        self.make_place("Tartine")
+
+        out, err = self.run_todo()
+
+        self.assertIn("Blue Bottle", out)
+        self.assertIn("Tartine", out)
+
+    def test_visited_places_are_left_out(self):
+        self.make_place("Blue Bottle")
+        self.make_place(
+            "Sightglass",
+            status=Place.Status.VISITED,
+            last_visited_at=datetime(2024, 3, 9, 18, 30, tzinfo=timezone.utc),
+        )
+
+        out, err = self.run_todo()
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Sightglass", out)
+
+    def test_the_output_carries_a_count_of_what_was_listed(self):
+        for name in ("Blue Bottle", "Tartine", "Zuni"):
+            self.make_place(name)
+
+        out, err = self.run_todo()
+
+        self.assertIn("3", out)
+
+    def test_a_line_carries_the_name_neighborhood_tags_and_note(self):
+        self.make_place(
+            "Blue Bottle",
+            tags=["coffee", "wifi"],
+            neighborhood="Mission",
+            note="good wifi, quiet before 10",
+        )
+
+        out, err = self.run_todo()
+
+        for expected in ("Blue Bottle", "Mission", "coffee", "wifi", "good wifi"):
+            with self.subTest(expected=expected):
+                self.assertIn(expected, out)
+
+    def test_a_place_with_only_a_name_prints_cleanly(self):
+        self.make_place("Tartine")
+
+        out, err = self.run_todo()
+
+        line = next(line for line in self.lines(out) if "Tartine" in line)
+        self.assertEqual(line.strip(), "Tartine")
+        self.assertNotIn("None", out)
+
+    def test_a_long_note_does_not_wrap_the_line(self):
+        self.make_place("Tartine", note="word " * 200)
+
+        out, err = self.run_todo()
+
+        self.assertEqual(len([line for line in self.lines(out) if "word" in line]), 1)
+
+    def test_a_successful_listing_writes_nothing_to_stderr(self):
+        self.make_place("Tartine")
+
+        out, err = self.run_todo()
+
+        self.assertEqual(err, "")
+
+
+class TodoCommandOrderingTests(TodoCommandTestCase):
+    """Oldest first, deterministically."""
+
+    def test_the_oldest_wishlist_place_is_listed_first(self):
+        self.make_place(
+            "Newer", created_at=datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc)
+        )
+        self.make_place(
+            "Older", created_at=datetime(2023, 1, 2, 9, 0, tzinfo=timezone.utc)
+        )
+
+        out, err = self.run_todo()
+
+        self.assertEqual(self.listed_names(out, ["Older", "Newer"]), ["Older", "Newer"])
+
+    def test_three_places_come_back_in_created_order_not_alphabetical(self):
+        stamps = {
+            "Zuni": datetime(2023, 1, 1, 9, 0, tzinfo=timezone.utc),
+            "Alpha": datetime(2023, 6, 1, 9, 0, tzinfo=timezone.utc),
+            "Mid": datetime(2024, 1, 1, 9, 0, tzinfo=timezone.utc),
+        }
+        for name, created_at in stamps.items():
+            self.make_place(name, created_at=created_at)
+
+        out, err = self.run_todo()
+
+        self.assertEqual(
+            self.listed_names(out, list(stamps)), ["Zuni", "Alpha", "Mid"]
+        )
+
+    def test_places_created_in_the_same_instant_are_ordered_by_name(self):
+        same_instant = datetime(2024, 1, 1, 9, 0, tzinfo=timezone.utc)
+        for name in ("Zuni", "Blue Bottle", "Mission Pie"):
+            self.make_place(name, created_at=same_instant)
+
+        out, err = self.run_todo()
+
+        self.assertEqual(
+            self.listed_names(out, ["Zuni", "Blue Bottle", "Mission Pie"]),
+            ["Blue Bottle", "Mission Pie", "Zuni"],
+        )
+
+    def test_the_name_tie_break_ignores_case(self):
+        """SQLite sorts uppercase before lowercase, so a plain ``name`` sort
+        would put ``Zoo`` above ``abc``."""
+        same_instant = datetime(2024, 1, 1, 9, 0, tzinfo=timezone.utc)
+        for name in ("Zoo Cafe", "abc Cafe"):
+            self.make_place(name, created_at=same_instant)
+
+        out, err = self.run_todo()
+
+        self.assertEqual(
+            self.listed_names(out, ["Zoo Cafe", "abc Cafe"]), ["abc Cafe", "Zoo Cafe"]
+        )
+
+    def test_a_filtered_listing_keeps_the_same_ordering_rule(self):
+        self.make_place(
+            "Newer Coffee",
+            tags=["coffee"],
+            created_at=datetime(2024, 6, 1, 12, 0, tzinfo=timezone.utc),
+        )
+        self.make_place(
+            "Older Coffee",
+            tags=["coffee"],
+            created_at=datetime(2023, 1, 2, 9, 0, tzinfo=timezone.utc),
+        )
+
+        out, err = self.run_todo("--tag", "coffee")
+
+        self.assertEqual(
+            self.listed_names(out, ["Older Coffee", "Newer Coffee"]),
+            ["Older Coffee", "Newer Coffee"],
+        )
+
+
+class TodoCommandEmptyCaseTests(TodoCommandTestCase):
+    """Three different pieces of news, each of them exit 0."""
+
+    def test_an_empty_journal_says_so_and_lists_nothing(self):
+        out, err = self.run_todo()
+
+        self.assertEqual(Place.objects.count(), 0)
+        self.assertIn("empty", out.lower())
+
+    def test_an_empty_journal_is_not_an_error(self):
+        """``call_command`` raising is what a non-zero exit looks like here."""
+        try:
+            self.run_todo()
+        except CommandError as error:  # pragma: no cover - the failure path
+            self.fail(f"an empty journal must exit 0, raised: {error}")
+
+    def test_a_cleared_wishlist_reads_differently_from_an_empty_journal(self):
+        empty_journal, _ = self.run_todo()
+        self.make_place(
+            "Sightglass",
+            status=Place.Status.VISITED,
+            last_visited_at=datetime(2024, 3, 9, 18, 30, tzinfo=timezone.utc),
+        )
+
+        cleared, _ = self.run_todo()
+
+        self.assertNotEqual(cleared.strip(), empty_journal.strip())
+        self.assertIn("wishlist", cleared.lower())
+        self.assertNotIn("Sightglass", cleared)
+
+    def test_filters_matching_nothing_read_differently_again(self):
+        self.make_place("Blue Bottle", tags=["coffee"], neighborhood="Mission")
+
+        no_matches, _ = self.run_todo("--tag", "ramen")
+
+        self.assertNotIn("Blue Bottle", no_matches)
+        self.assertIn("filter", no_matches.lower())
+
+    def test_a_tag_that_exists_on_no_place_at_all_is_not_an_error(self):
+        self.make_place("Blue Bottle", tags=["coffee"])
+
+        try:
+            out, err = self.run_todo("--tag", "nonexistent")
+        except CommandError as error:  # pragma: no cover - the failure path
+            self.fail(f"an unknown tag must exit 0, raised: {error}")
+
+        self.assertNotIn("Blue Bottle", out)
+
+    def test_the_three_empty_messages_are_all_different(self):
+        todo = _todo_module()
+
+        messages = {
+            todo.EMPTY_JOURNAL_MESSAGE,
+            todo.WISHLIST_CLEARED_MESSAGE,
+            todo.NO_FILTER_MATCHES_MESSAGE,
+        }
+        self.assertEqual(len(messages), 3)
+
+
+class TodoCommandFilterTests(TodoCommandTestCase):
+    """``--tag`` and ``--neighborhood``, ANDed, never leaking visited places."""
+
+    def setUp(self):
+        self.coffee = self.make_place(
+            "Blue Bottle", tags=["coffee"], neighborhood="Mission"
+        )
+        self.ramen = self.make_place("Ramen Shop", tags=["ramen"], neighborhood="SoMa")
+        self.coffee_soma = self.make_place(
+            "Sightglass Wish", tags=["coffee"], neighborhood="SoMa"
+        )
+
+    def test_tag_lists_only_places_carrying_that_tag(self):
+        out, err = self.run_todo("--tag", "coffee")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertIn("Sightglass Wish", out)
+        self.assertNotIn("Ramen Shop", out)
+
+    def test_the_tag_filter_ignores_case(self):
+        baseline, _ = self.run_todo("--tag", "coffee")
+
+        for typed in ("Coffee", "COFFEE", "  Coffee  "):
+            with self.subTest(typed=typed):
+                out, err = self.run_todo("--tag", typed)
+
+                self.assertEqual(out, baseline)
+                self.assertIn("Blue Bottle", out)
+
+    def test_the_tag_filter_matches_the_whole_tag_not_a_substring(self):
+        """The same hard line ``--neighborhood`` draws. ``--tag cof`` must not
+        quietly list every coffee place, and ``--tag coffeehouse`` must not
+        match ``coffee`` from the other direction."""
+        for typed in ("cof", "coffeehouse", "offe"):
+            with self.subTest(typed=typed):
+                out, err = self.run_todo("--tag", typed)
+
+                self.assertNotIn("Blue Bottle", out)
+                self.assertNotIn("Sightglass Wish", out)
+                self.assertIn("filter", out.lower())
+
+    def test_the_tag_filter_strips_surrounding_whitespace(self):
+        """The ``NOCASE`` collation folds case but does not strip, which is
+        why the normalizer runs at the entry point."""
+        out, err = self.run_todo("--tag", "  coffee  ")
+
+        self.assertIn("Blue Bottle", out)
+
+    def test_neighborhood_lists_only_places_in_that_neighborhood(self):
+        out, err = self.run_todo("--neighborhood", "Mission")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Ramen Shop", out)
+
+    def test_the_neighborhood_filter_ignores_case(self):
+        for typed in ("mission", "MISSION", "Mission"):
+            with self.subTest(typed=typed):
+                out, err = self.run_todo("--neighborhood", typed)
+
+                self.assertIn("Blue Bottle", out)
+
+    def test_the_neighborhood_filter_strips_surrounding_whitespace(self):
+        """``__iexact`` folds case but matches the value verbatim otherwise,
+        so the padding has to come off before the filter is built."""
+        out, err = self.run_todo("--neighborhood", "  Mission  ")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Ramen Shop", out)
+
+    def test_the_neighborhood_filter_matches_the_whole_value_not_a_substring(self):
+        """Partial neighborhood matching is ``find``'s job, deliberately."""
+        out, err = self.run_todo("--neighborhood", "Miss")
+
+        self.assertNotIn("Blue Bottle", out)
+        self.assertIn("filter", out.lower())
+
+    def test_both_filters_are_anded(self):
+        out, err = self.run_todo("--tag", "Coffee", "--neighborhood", "soma")
+
+        self.assertIn("Sightglass Wish", out)
+        self.assertNotIn("Blue Bottle", out)
+        self.assertNotIn("Ramen Shop", out)
+
+    def test_filters_never_leak_a_visited_place(self):
+        self.make_place(
+            "Visited Coffee",
+            tags=["coffee"],
+            neighborhood="Mission",
+            status=Place.Status.VISITED,
+            last_visited_at=datetime(2024, 3, 9, 18, 30, tzinfo=timezone.utc),
+        )
+
+        for args in (("--tag", "coffee"), ("--neighborhood", "Mission"), ()):
+            with self.subTest(args=args):
+                out, err = self.run_todo(*args)
+
+                self.assertNotIn("Visited Coffee", out)
+
+
+class TodoCommandQueryCountTests(TodoCommandTestCase):
+    """Each line names the place's tags, and ``Place.tags`` is a related
+    manager: without a prefetch that is one query per wishlist place."""
+
+    def populate(self, count, offset=0):
+        for index in range(offset, offset + count):
+            self.make_place(f"Coffee Number {index}", tags=["coffee", "wifi"])
+
+    def queries_for_a_listing(self):
+        with CaptureQueriesContext(connection) as captured:
+            self.run_todo()
+        return len(captured)
+
+    def test_the_query_count_does_not_grow_with_the_wishlist(self):
+        self.populate(3)
+        few = self.queries_for_a_listing()
+
+        self.populate(15, offset=3)
+        many = self.queries_for_a_listing()
+
+        self.assertEqual(few, many)
+        self.assertLess(many, Place.objects.count())
+
+    def test_the_query_count_does_not_grow_when_filters_are_applied(self):
+        self.populate(12)
+
+        with CaptureQueriesContext(connection) as captured:
+            self.run_todo("--tag", "Coffee")
+
+        self.assertLess(len(captured), Place.objects.count())
+
+
+class WishlistLoopIntegrationTests(TodoCommandTestCase):
+    """The loop the issue is named for: on the list, then off it."""
+
+    def run_visit(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("visit", *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def test_a_visited_place_drops_off_the_wishlist(self):
+        self.make_place("Blue Bottle", tags=["coffee"], neighborhood="Mission")
+        self.make_place("Tartine")
+
+        before, _ = self.run_todo()
+        self.run_visit("Blue Bottle", "--rating", "5", "--note", "great cortado")
+        after, _ = self.run_todo()
+
+        self.assertIn("Blue Bottle", before)
+        self.assertNotIn("Blue Bottle", after)
+        self.assertIn("Tartine", after)
+
+    def test_visiting_the_last_wishlist_place_clears_the_list(self):
+        self.make_place("Blue Bottle")
+
+        self.run_visit("Blue Bottle")
+        out, err = self.run_todo()
+
+        self.assertIn(_todo_module().WISHLIST_CLEARED_MESSAGE, out)
