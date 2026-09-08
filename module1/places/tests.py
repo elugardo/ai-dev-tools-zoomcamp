@@ -2122,6 +2122,111 @@ class SearchEmptyAndDegenerateInputTests(unittest.TestCase):
         self.assertFalse(results.is_weak)
 
 
+class SearchUntokenizableQueryTests(unittest.TestCase):
+    """A query the tokenizer cannot see any of is the same as no query (#18).
+
+    ``кофе`` is real search intent typed by a real user, but
+    ``_TOKEN_PATTERN`` keeps ASCII alphanumeric runs only, so nothing in it
+    reaches the scorer and every candidate lands on 0. The fallback header
+    claims "I looked and nothing was good enough"; over a comparison that
+    never happened, that is the tool pretending. So the ranker answers such a
+    query exactly as it answers an empty one -- nothing, and no fallback.
+
+    Making non-Latin text *searchable* is a wider token pattern, a feature,
+    and deliberately not this.
+    """
+
+    UNTOKENIZABLE = ("кофе", "寿司", "🍜🍣", "---", "!!!", "  ??  ", "…", "€ £")
+
+    def test_a_query_with_no_tokens_returns_nothing_and_does_not_fall_back(self):
+        for query in self.UNTOKENIZABLE:
+            with self.subTest(query=query):
+                results = search.rank_places(query, SAMPLE_PLACES)
+
+                self.assertEqual(list(results), [])
+                self.assertFalse(results.is_weak)
+
+    def test_it_answers_such_a_query_exactly_as_it_answers_an_empty_one(self):
+        """The criterion in one line: no query and no tokens are one case."""
+        empty = search.rank_places("", SAMPLE_PLACES)
+
+        for query in self.UNTOKENIZABLE:
+            with self.subTest(query=query):
+                results = search.rank_places(query, SAMPLE_PLACES)
+
+                self.assertEqual(
+                    (len(results), results.is_weak), (len(empty), empty.is_weak)
+                )
+
+    def test_one_token_the_scorer_can_read_makes_it_a_real_query_again(self):
+        """The rule is about tokens, not about the script the query is in: a
+        single readable token puts the query back on the normal path."""
+        results = search.rank_places("кофе coffee", SAMPLE_PLACES)
+
+        self.assertFalse(results.is_weak)
+        self.assertEqual([result.place for result in results], [BLUE_BOTTLE])
+
+    def test_a_query_that_tokenizes_but_matches_nothing_keeps_its_fallback(self):
+        """The guard must not become "every score is 0, so return nothing".
+        ``4`` is a real query that happens to match none of these places, and
+        the closest three are exactly what it should get."""
+        results = search.rank_places("4", SAMPLE_PLACES)
+
+        self.assertEqual(len(results), search.WEAK_MATCH_LIMIT)
+        self.assertTrue(results.is_weak)
+        self.assertEqual([result.score for result in results], [0, 0, 0])
+
+    def test_queries_that_do_tokenize_score_what_they_scored_before(self):
+        """Nothing above the guard moved. These are the current numbers,
+        pinned so that neither a widened token pattern nor a guard that
+        rejected every query carrying a non-ASCII character -- which would
+        take ``café`` with it -- can arrive quietly as part of a bug fix."""
+        cafe = place("Café Réveille", "pastries", "Hayes Valley", ["coffee"])
+
+        for query, candidates, expected in (
+            ("blu bottl", SAMPLE_PLACES, [("Blue Bottle", 79.48)]),
+            ("cofee", SAMPLE_PLACES, [("Blue Bottle", 68.18)]),
+            ("café", [cafe], [("Café Réveille", 90.0)]),
+            ("cafe", [cafe], [("Café Réveille", 77.14)]),
+        ):
+            with self.subTest(query=query):
+                results = search.rank_places(query, candidates)
+
+                self.assertFalse(results.is_weak)
+                self.assertEqual(
+                    [(result.place.name, result.score) for result in results], expected
+                )
+
+
+class SearchTokenPredicateTests(unittest.TestCase):
+    """``has_searchable_tokens``: the ranker's own "is there anything to
+    search for here?", exported so a caller can reject such a query before it
+    reads a database without keeping a second copy of the tokenizer (#6)."""
+
+    def test_it_is_true_for_a_query_the_ranker_can_score(self):
+        for query in ("coffee", "blu bottl", "4", "4!", "café", "  ramen  "):
+            with self.subTest(query=query):
+                self.assertTrue(search.has_searchable_tokens(query))
+
+    def test_it_is_false_for_a_query_the_ranker_cannot_score(self):
+        for query in ("", "   ", "	", "---", "!!!", "кофе", "寿司", "🍜", None):
+            with self.subTest(query=query):
+                self.assertFalse(search.has_searchable_tokens(query))
+
+    def test_it_cannot_drift_away_from_what_ranking_actually_does(self):
+        """Why it lives here and not in the command: a false answer from this
+        predicate is exactly an empty, non-weak result set from the ranker."""
+        for query in ("coffee", "4", "café", "", "  ", "---", "кофе", "寿司"):
+            with self.subTest(query=query):
+                results = search.rank_places(query, SAMPLE_PLACES)
+
+                if search.has_searchable_tokens(query):
+                    self.assertGreater(len(results), 0)
+                else:
+                    self.assertEqual(len(results), 0)
+                    self.assertFalse(results.is_weak)
+
+
 class SearchDeterminismTests(unittest.TestCase):
     """Same data in, same order out -- every run, whatever the input order."""
 
@@ -2279,6 +2384,23 @@ class FindCommandSourceRuleTests(SimpleTestCase):
 
         self.assertNotIn("sorted", called)
         self.assertNotIn("sort", called)
+
+    def test_find_does_not_hand_roll_the_rankers_tokenizer(self):
+        """The rule this issue exists because of (#18).
+
+        The bug was two layers disagreeing about what counts as searchable
+        text, and the way that happens is a command deciding it for itself.
+        So the guard asks ``has_searchable_tokens`` -- the ranker's own
+        tokenizer -- and ``find.py`` owns no token pattern of its own.
+
+        Source-level because it has to be: a local ``re.compile(r"[0-9a-zA-Z]+")``
+        here is behaviorally equivalent to the delegation *today*, so no
+        behavioral test can tell them apart. It stops being equivalent the
+        moment ``_TOKEN_PATTERN`` moves, which is exactly when a second copy
+        would resurrect the bug.
+        """
+        self.assertIn("has_searchable_tokens", _called_names(_find_module()))
+        self.assertNotIn("re", _imported_modules(_find_module()))
 
     def test_find_does_not_hand_roll_tag_normalization(self):
         called = _called_names(_find_module())
@@ -2544,6 +2666,61 @@ class FindCommandArgumentTests(FindCommandTestCase):
 
         Place.objects.all().delete()
         self.run_find("anything")
+
+
+class FindUntokenizableQueryTests(FindCommandTestCase):
+    """``find "кофе"`` is a rejection, not three arbitrary guesses (#18).
+
+    The bug these pin: ``str.isalnum()`` is Unicode-aware and the ranker's
+    tokenizer is not, so the command let ``кофе`` through and the ranker then
+    scored every place 0 and printed "No strong match. Closest 3:" over a
+    comparison it never made. The guard now asks the ranker's own tokenizer,
+    so the two layers cannot disagree again.
+    """
+
+    def populate(self):
+        for index in range(5):
+            self.make_place(f"Place {index}")
+
+    def test_a_query_the_ranker_cannot_read_is_rejected_and_prints_nothing(self):
+        self.populate()
+
+        for query in ("кофе", "寿司", "🍜", "€ £"):
+            with self.subTest(query=query):
+                error = self.assert_rejected("--", query)
+
+                self.assertIn("query", str(error))
+                self.assertNotIn("No strong match", str(error))
+
+    def test_it_is_the_same_message_and_the_same_exit_code_as_an_empty_query(self):
+        """The criterion the two layers used to disagree about."""
+        self.populate()
+
+        blank = self.assert_rejected("")
+        cyrillic = self.assert_rejected("--", "кофе")
+
+        self.assertEqual(str(cyrillic), str(blank))
+        self.assertEqual(cyrillic.returncode, blank.returncode)
+
+    def test_the_punctuation_query_gets_that_same_message_too(self):
+        """``---`` was already rejected, but with its own wording. One thing
+        wrong, one thing said."""
+        self.populate()
+
+        self.assertEqual(
+            str(self.assert_rejected("--", "---")), str(self.assert_rejected(""))
+        )
+
+    def test_one_readable_token_still_searches_normally(self):
+        """The guard is about tokens, not about the script: a query mixing
+        Cyrillic with a word the ranker can read is a real query."""
+        self.make_place("Blue Bottle", tags=["coffee"], note="good wifi")
+        self.populate()
+
+        out, err = self.run_find("кофе coffee")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("No strong match", out)
 
 
 class FindCommandFilterTests(FindCommandTestCase):

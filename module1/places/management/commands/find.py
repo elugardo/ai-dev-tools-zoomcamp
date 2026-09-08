@@ -26,11 +26,17 @@ Design notes worth keeping in view:
   path, but it does not strip -- ``--tag " coffee "`` needs the normalizer.
 * **A query with nothing to search for is rejected, not guessed at.** ``""``
   and ``"   "`` are the obvious cases; ``"---"`` and ``"!!"`` are the same
-  thing wearing punctuation. The ranker only ever sees letters and digits, so
-  such a query cannot express a preference between any two places -- printing
-  "No strong match. Closest 3:" above three arbitrary places would be the tool
-  pretending it looked. The fallback means "I looked and nothing was good
-  enough", and that claim needs a real query behind it.
+  thing wearing punctuation, and so is ``"кофе"`` -- real intent in a script
+  the ranker's tokenizer cannot see. Such a query cannot express a preference
+  between any two places, so printing "No strong match. Closest 3:" above
+  three arbitrary places would be the tool pretending it looked. The fallback
+  means "I looked and nothing was good enough", and that claim needs a real
+  query behind it. **Which queries those are is the ranker's call, not this
+  command's** (issue #18): the guard asks
+  :func:`places.search.has_searchable_tokens` rather than re-deciding with a
+  second copy of the tokenizer, which is how the two layers stopped
+  disagreeing about ``"кофе"``. One rejection, one message, one exit code, for
+  every query with nothing in it to match on.
 * **Finding nothing is an answer, not a failure.** An empty journal, filters
   that eliminate everything and a weak fallback all exit 0. Only a malformed
   invocation exits non-zero.
@@ -39,7 +45,7 @@ Design notes worth keeping in view:
 from django.core.management.base import BaseCommand, CommandError
 
 from places.models import Place, normalize_tag_name
-from places.search import rank_places
+from places.search import has_searchable_tokens, rank_places
 
 #: How many strong matches are printed when ``--limit`` is not given.
 DEFAULT_LIMIT = 5
@@ -51,6 +57,17 @@ NOTE_SNIPPET_LENGTH = 80
 
 #: Appended to a note that was cut, so a truncated line admits it.
 TRUNCATION_MARKER = "…"
+
+#: Raised when the query holds nothing the ranker can match on. One message,
+#: word for word, covers ``""``, ``"   "``, ``"---"`` and ``"кофе"`` alike,
+#: because the ranker draws no distinction between them either: all four leave
+#: it with no tokens to score, and it answers all four with an empty, non-weak
+#: result set. The query is not echoed back precisely so that the four stay one
+#: rejection rather than becoming four similar ones (issue #18).
+NOTHING_TO_SEARCH_FOR_MESSAGE = (
+    "There is nothing to search for in that query: it needs at least one "
+    'letter a-z or digit 0-9, e.g. find "coffee wifi".'
+)
 
 #: Printed when the journal itself is empty. Deliberately worded so no
 #: substring of it can be confused with :data:`NO_FILTER_MATCHES_MESSAGE`.
@@ -106,13 +123,8 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         # --- the invocation has to make sense before anything is read -------
         query = (options["query"] or "").strip()
-        if not query:
-            raise CommandError('A query is required, e.g. find "coffee wifi".')
-        if not any(character.isalnum() for character in query):
-            raise CommandError(
-                f'There is nothing to search for in "{query}": a query needs '
-                "at least one letter or digit."
-            )
+        if not has_searchable_tokens(query):
+            raise CommandError(NOTHING_TO_SEARCH_FOR_MESSAGE)
 
         limit = options["limit"]
         if limit < 1:

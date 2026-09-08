@@ -65,6 +65,18 @@ answer: a caller never has to import the threshold or compare scores itself.
 * An empty or whitespace-only query: an empty result set, and *no* fallback.
   The fallback means "I looked and nothing was good enough"; with no query
   there is nothing to be near.
+* **A query that tokenizes to nothing means the same thing as no query at
+  all**, and gets the same empty, non-weak result set. Tokens are ASCII
+  alphanumeric runs, so ``"---"``, an emoji, and any text in a non-Latin
+  script -- ``"кофе"``, ``"寿司"`` -- all reduce to no tokens. Text this
+  module cannot see cannot make it prefer one candidate to another, so every
+  candidate would score 0 and the fallback would print three arbitrary places
+  under a header claiming we looked. An empty *query* and a query with no
+  *tokens* are therefore one case here, not two.
+  :func:`has_searchable_tokens` exposes that same test, so a caller can reject
+  such a query up front without keeping a second copy of the tokenizer.
+  Making non-Latin text actually *searchable* is a different change -- a wider
+  token pattern -- and would be a feature, not this rule.
 
 How a score is built
 --------------------
@@ -197,15 +209,18 @@ def rank_places(query, candidates):
     and the weak-match fallback. ``candidates`` may be any iterable; it is read
     once and never mutated.
     """
-    cleaned = (query or "").strip()
     candidates = tuple(candidates)
+    query_tokens = _tokenize((query or "").strip())
 
-    # No query and no candidates are different kinds of nothing, but both
-    # answer with an empty set -- and neither triggers the fallback.
-    if not cleaned or not candidates:
+    # No query, a query with no tokens, and no candidates are three different
+    # kinds of nothing, but all three answer with an empty set -- and none of
+    # them triggers the fallback. A query the tokenizer cannot see any of --
+    # "---", an emoji, "кофе" -- scores every candidate 0, so the three places
+    # the fallback would offer are arbitrary; saying "I looked and nothing was
+    # good enough" over them would be a lie.
+    if not query_tokens or not candidates:
         return RankedResults(results=(), is_weak=False)
 
-    query_tokens = _tokenize(cleaned)
     scored = [(_score(query_tokens, place), place) for place in candidates]
     scored.sort(key=lambda pair: (-pair[0], _sort_name(pair[1])))
 
@@ -213,6 +228,18 @@ def rank_places(query, candidates):
     if strong:
         return _results(strong, is_weak=False)
     return _results(scored[:WEAK_MATCH_LIMIT], is_weak=True)
+
+
+def has_searchable_tokens(query):
+    """True when ``query`` holds at least one token :func:`rank_places` can score.
+
+    The public form of "is there anything to search for here?", so a caller
+    that wants to reject such a query before it reads a database asks the
+    tokenizer that will actually run rather than keeping a second copy of it.
+    ``rank_places`` answers every query this returns false for exactly as it
+    answers an empty one: an empty result set, no fallback.
+    """
+    return bool(_tokenize((query or "").strip()))
 
 
 def _results(scored, is_weak):
