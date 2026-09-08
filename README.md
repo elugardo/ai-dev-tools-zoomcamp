@@ -60,8 +60,8 @@ module1/
 
 ### Status
 
-Scaffolded and planned; the commands are not built yet. Setup and usage
-instructions land with issue
-[#10](https://github.com/elugardo/ai-dev-tools-zoomcamp/issues/10) in
-`module1/README.md`. Until then, `AGENTS.md` has the commands needed to run the
-project.
+Module 1 is built: all six commands (`add`, `find`, `todo`, `visit`, `surprise`,
+`stats`) and the admin are working, with the test suite green.
+
+Setup, a reference for every command, and a recorded session against a real
+journal are in [`module1/README.md`](module1/README.md).
