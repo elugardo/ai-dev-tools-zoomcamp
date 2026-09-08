@@ -4961,3 +4961,776 @@ class SurpriseQueryCountTests(SurpriseCommandTestCase):
 
         self.assertEqual(few, many)
         self.assertLess(many, Place.objects.count())
+
+
+# ---------------------------------------------------------------------------
+# Coverage: the `stats` command (issue #9)
+#
+# Every number in the report has to come out of the database, and the one way
+# this task goes wrong is the many-to-many: joining tags multiplies place rows,
+# so a place with three tags gets counted three times. The trap is pinned
+# below on the counts, the neighborhood breakdown and the tag rows.
+#
+# Rows are asserted by finding the line that carries a label and reading the
+# number off the end of it -- never by matching a padded literal, per
+# `_docs/testing-guidelines.md`.
+# ---------------------------------------------------------------------------
+
+
+#: The cap issue #9 sets on the report's query count.
+STATS_QUERY_BUDGET = 5
+
+#: What the command actually costs: one aggregate for the counts, one for the
+#: neighborhoods touched, one grouped query for the breakdown, one for the
+#: tags. Pinned exactly so an accidental fifth query is a failure, not a
+#: shrug -- and checked against the budget above.
+STATS_QUERIES = 4
+
+#: The literal label issue #9 names for places with no neighborhood.
+NO_NEIGHBORHOOD_ROW = "(no neighborhood)"
+
+
+def _stats_module():
+    """The ``stats`` command module, imported the way Django finds it."""
+    from places.management.commands import stats as stats_module
+
+    return stats_module
+
+
+class StatsCommandDiscoveryTests(SimpleTestCase):
+    """The command is registered, and takes nothing at all."""
+
+    def parser(self):
+        return load_command_class("places", "stats").create_parser("manage.py", "stats")
+
+    def test_stats_is_registered_as_a_command_of_the_places_app(self):
+        self.assertEqual(get_commands().get("stats"), "places")
+
+    def test_stats_takes_no_arguments(self):
+        """An empty argv parses; anything positional does not."""
+        self.parser().parse_args([])
+
+        with self.assertRaises((CommandError, SystemExit)):
+            with redirect_stderr(StringIO()):
+                self.parser().parse_args(["mission"])
+
+    def test_the_out_of_scope_flags_are_absent(self):
+        """Issue #9 rules each of these out by name: the report is one fixed
+        view, with no filtering, no widening and no machine-readable form."""
+        help_text = self.parser().format_help()
+
+        for flag in (
+            "--tag",
+            "--neighborhood",
+            "--status",
+            "--top",
+            "--all",
+            "--limit",
+            "--json",
+            "--csv",
+            "--since",
+        ):
+            with self.subTest(flag=flag):
+                self.assertNotIn(flag, help_text)
+
+
+class StatsAggregationRuleTests(SimpleTestCase):
+    """Issue #9 requires the numbers to be computed by the database.
+
+    Read off the parsed syntax tree rather than the source text: a docstring
+    that *mentions* ``Counter`` to explain why it is not used would satisfy a
+    substring search, and an accurate sentence added later would break one.
+    """
+
+    def test_stats_aggregates_in_the_database(self):
+        called = _called_names(_stats_module())
+
+        self.assertIn("Count", called)
+        self.assertTrue(
+            {"annotate", "aggregate"} & called,
+            "the report must be built with annotate/aggregate",
+        )
+
+    def test_stats_does_not_tally_in_python(self):
+        """No ``Counter``, no ``sorted``, no hand-rolled ordering: counting and
+        ordering are the database's job here."""
+        called = _called_names(_stats_module())
+
+        for banned in ("Counter", "sorted", "sort", "defaultdict", "groupby"):
+            with self.subTest(name=banned):
+                self.assertNotIn(banned, called)
+
+    def test_stats_does_not_import_a_counting_helper(self):
+        imported = _imported_modules(_stats_module())
+
+        for banned in ("collections", "itertools", "operator"):
+            with self.subTest(module=banned):
+                self.assertNotIn(banned, imported)
+
+    def test_stats_does_not_touch_the_models_module_beyond_reading_it(self):
+        """No denormalized counters: issue #2 rules them out and issue #9
+        exists so none are needed. The command may only read."""
+        called = _called_names(_stats_module())
+
+        for banned in ("save", "create", "update", "add", "bulk_update"):
+            with self.subTest(name=banned):
+                self.assertNotIn(banned, called)
+
+
+class StatsCommandTestCase(TestCase):
+    """Shared plumbing: run ``stats`` through ``call_command``."""
+
+    def make_place(self, name, tags=(), **fields):
+        place = Place.objects.create(name=name, **fields)
+        for tag_name in tags:
+            place.tags.add(Tag.objects.get_or_create(name=tag_name)[0])
+        return place
+
+    def run_stats(self, *args):
+        out, err = StringIO(), StringIO()
+        call_command("stats", *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def lines(self, out):
+        return [line for line in out.splitlines() if line.strip()]
+
+    def row_count(self, out, label):
+        """The number on the row labelled ``label``.
+
+        Found by the label and read as the trailing token, so the assertion
+        says nothing about padding or column positions.
+        """
+        for line in self.lines(out):
+            stripped = line.strip()
+            if stripped.startswith(label):
+                rest = stripped[len(label) :].strip()
+                if rest.isdigit():
+                    return int(rest)
+        self.fail(f"no row labelled {label!r} in:\n{out}")
+
+    def has_row(self, out, label):
+        """Whether a row labelled ``label`` was printed at all."""
+        for line in self.lines(out):
+            stripped = line.strip()
+            if stripped.startswith(label) and stripped[len(label) :].strip().isdigit():
+                return True
+        return False
+
+    def order_of(self, out, labels):
+        """The given labels, in the order their rows appear in ``out``."""
+        found = []
+        for line in self.lines(out):
+            stripped = line.strip()
+            for label in labels:
+                if stripped.startswith(label) and label not in found:
+                    found.append(label)
+        return found
+
+    def section_rows(self, out, heading):
+        """The rows under ``heading``, up to the next heading or blank line."""
+        rows, collecting = [], False
+        for line in out.splitlines():
+            if line.strip() == heading:
+                collecting = True
+                continue
+            if collecting:
+                if not line.strip():
+                    break
+                rows.append(line.strip())
+        return rows
+
+
+class StatsEmptyJournalTests(StatsCommandTestCase):
+    """An empty journal is news, not a table of zeros."""
+
+    def headings(self):
+        module = _stats_module()
+        return (
+            module.COUNTS_HEADING,
+            module.TOUCHED_HEADING,
+            module.NEIGHBORHOOD_HEADING,
+            module.TAGS_HEADING,
+        )
+
+    def test_an_empty_journal_says_so_on_stdout_and_exits_zero(self):
+        out, _ = self.run_stats()
+
+        self.assertIn("Nothing recorded yet", out)
+
+    def test_the_empty_message_points_at_add_as_the_next_step(self):
+        out, _ = self.run_stats()
+
+        self.assertIn("add", out)
+
+    def test_the_empty_report_carries_none_of_the_four_headings(self):
+        out, _ = self.run_stats()
+
+        for heading in self.headings():
+            with self.subTest(heading=heading):
+                self.assertNotIn(heading, out)
+
+    def test_the_empty_report_prints_no_counts_at_all(self):
+        """Not a single digit, so there is no zero-valued table to misread."""
+        out, _ = self.run_stats()
+
+        self.assertFalse(any(character.isdigit() for character in out), out)
+
+    def test_the_empty_report_prints_no_neighborhood_or_tag_rows(self):
+        out, _ = self.run_stats()
+
+        self.assertNotIn(NO_NEIGHBORHOOD_ROW, out)
+        self.assertEqual(len(self.lines(out)), 1)
+
+    def test_tags_with_no_places_is_still_the_empty_case(self):
+        """Tags belonging to nothing are not a journal."""
+        Tag.objects.create(name="coffee")
+        Tag.objects.create(name="ramen")
+
+        out, _ = self.run_stats()
+
+        self.assertIn("Nothing recorded yet", out)
+        # "coffee" appears in the example command the message suggests, so the
+        # assertion is that no tag *row* was printed, not that the word is absent.
+        self.assertFalse(self.has_row(out, "coffee"), out)
+        self.assertEqual(len(self.lines(out)), 1)
+
+
+class StatsSectionTests(StatsCommandTestCase):
+    """Four sections, in one fixed order, stable across runs."""
+
+    def setUp(self):
+        self.make_place("Blue Bottle", neighborhood="Mission", tags=["coffee"])
+        self.make_place("Nopalito", neighborhood="Soma", status=Place.Status.VISITED)
+
+    def test_the_four_headings_are_printed_in_the_documented_order(self):
+        module = _stats_module()
+        headings = [
+            module.COUNTS_HEADING,
+            module.TOUCHED_HEADING,
+            module.NEIGHBORHOOD_HEADING,
+            module.TAGS_HEADING,
+        ]
+
+        out, _ = self.run_stats()
+
+        positions = [out.index(heading) for heading in headings]
+        self.assertEqual(positions, sorted(positions))
+        self.assertEqual(len(set(positions)), len(headings))
+
+    def test_two_runs_on_the_same_data_print_the_same_screen(self):
+        first, _ = self.run_stats()
+        second, _ = self.run_stats()
+
+        self.assertEqual(first, second)
+
+    def test_the_report_writes_nothing_to_stderr(self):
+        _, err = self.run_stats()
+
+        self.assertEqual(err, "")
+
+
+class StatsCountTests(StatsCommandTestCase):
+    """The three headline numbers, and the m2m row-multiplication trap."""
+
+    def test_the_total_equals_the_number_of_places(self):
+        for index in range(4):
+            self.make_place(f"Place {index}")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "total places"), Place.objects.count())
+
+    def test_visited_and_wishlist_sum_to_the_total(self):
+        for index in range(3):
+            self.make_place(f"Been {index}", status=Place.Status.VISITED)
+        for index in range(2):
+            self.make_place(f"Want {index}")
+
+        out, _ = self.run_stats()
+
+        visited = self.row_count(out, "visited")
+        wishlist = self.row_count(out, "wishlist")
+        self.assertEqual((visited, wishlist), (3, 2))
+        self.assertEqual(visited + wishlist, self.row_count(out, "total places"))
+
+    def test_a_place_with_three_tags_is_counted_once(self):
+        """The many-to-many join multiplies place rows; the aggregation must
+        count distinct places, not joined rows. Issue #9 calls this the single
+        most likely way to get the task wrong."""
+        self.make_place(
+            "Blue Bottle", neighborhood="Mission", tags=["coffee", "wifi", "cheap"]
+        )
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "total places"), 1)
+        self.assertEqual(self.row_count(out, "wishlist"), 1)
+        self.assertEqual(self.row_count(out, "visited"), 0)
+        self.assertEqual(self.row_count(out, "Mission"), 1)
+
+    def test_tags_do_not_multiply_a_neighborhoods_rows_either(self):
+        """Two places in one neighborhood, one of them heavily tagged."""
+        self.make_place(
+            "Blue Bottle", neighborhood="Mission", tags=["coffee", "wifi", "cheap"]
+        )
+        self.make_place("Tartine", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "Mission"), 2)
+        self.assertEqual(self.row_count(out, "total places"), 2)
+
+    def test_a_place_with_no_tags_is_still_counted_everywhere(self):
+        self.make_place("Bare Bar", neighborhood="Soma", status=Place.Status.VISITED)
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "total places"), 1)
+        self.assertEqual(self.row_count(out, "visited"), 1)
+        self.assertEqual(self.row_count(out, "Soma"), 1)
+
+    def test_the_per_neighborhood_counts_sum_to_the_total(self):
+        self.make_place("Blue Bottle", neighborhood="Mission", tags=["coffee", "wifi"])
+        self.make_place("Tartine", neighborhood="Mission")
+        self.make_place("Nopalito", neighborhood="Soma")
+        self.make_place("Nameless", neighborhood="")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        totals = [int(row.rsplit(None, 1)[-1]) for row in rows]
+        self.assertEqual(sum(totals), self.row_count(out, "total places"))
+        self.assertEqual(sum(totals), 4)
+
+
+class StatsBlankNeighborhoodTests(StatsCommandTestCase):
+    """Blank is a bucket, and it is not a neighborhood touched."""
+
+    def test_an_empty_neighborhood_lands_under_the_literal_label(self):
+        self.make_place("Nameless", neighborhood="")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, NO_NEIGHBORHOOD_ROW), 1)
+
+    def test_a_whitespace_only_neighborhood_joins_the_same_bucket(self):
+        """Not its own row -- one bucket, whatever the blank looks like."""
+        self.make_place("Nameless", neighborhood="")
+        self.make_place("Spacey", neighborhood="   ")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, NO_NEIGHBORHOOD_ROW), 2)
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertEqual(len(rows), 1)
+
+    def test_blank_does_not_count_as_a_neighborhood_touched(self):
+        """Issue #9's worked example: two in Mission, one with none, touched
+        reads 1 while the breakdown shows two rows."""
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Tartine", neighborhood="Mission")
+        self.make_place("Nameless", neighborhood="")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 1)
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertEqual(len(rows), 2)
+
+    def test_a_whitespace_only_neighborhood_is_not_a_neighborhood_touched(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Spacey", neighborhood="   ")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 1)
+
+    def test_touched_equals_the_rows_minus_the_blank_row(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Nopalito", neighborhood="Soma")
+        self.make_place("Ippudo", neighborhood="Nob Hill")
+        self.make_place("Nameless", neighborhood="")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        blank_rows = [row for row in rows if row.startswith(NO_NEIGHBORHOOD_ROW)]
+        self.assertEqual(len(blank_rows), 1)
+        self.assertEqual(
+            self.row_count(out, "Neighborhoods touched:"), len(rows) - len(blank_rows)
+        )
+
+    def test_touched_equals_the_row_count_when_nothing_is_blank(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Nopalito", neighborhood="Soma")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), len(rows))
+        self.assertEqual(len(rows), 2)
+
+    def test_no_blank_row_is_printed_when_every_place_has_a_neighborhood(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Nopalito", neighborhood="Soma")
+
+        out, _ = self.run_stats()
+
+        self.assertNotIn(NO_NEIGHBORHOOD_ROW, out)
+
+    def test_the_blank_bucket_still_counts_towards_the_total(self):
+        self.make_place("Nameless", neighborhood="")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "total places"), 2)
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 1)
+
+
+class StatsNeighborhoodOrderingTests(StatsCommandTestCase):
+    """Counts descending, then name ascending, and blank always last."""
+
+    def test_rows_are_ordered_by_count_then_name(self):
+        """Issue #9's worked example: Soma=2, Mission=2, Nob Hill=1 prints as
+        Mission, Soma, Nob Hill."""
+        for index in range(2):
+            self.make_place(f"Soma {index}", neighborhood="Soma")
+        for index in range(2):
+            self.make_place(f"Mission {index}", neighborhood="Mission")
+        self.make_place("Nob", neighborhood="Nob Hill")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(
+            self.order_of(out, ["Mission", "Soma", "Nob Hill"]),
+            ["Mission", "Soma", "Nob Hill"],
+        )
+
+    def test_the_name_tie_break_is_ascending_not_descending(self):
+        """Created in the order that a descending sort would already produce,
+        so only an ascending tie-break can pass."""
+        self.make_place("A place", neighborhood="Zuma")
+        self.make_place("B place", neighborhood="Alamo")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.order_of(out, ["Alamo", "Zuma"]), ["Alamo", "Zuma"])
+
+    def test_the_name_tie_break_ignores_case(self):
+        self.make_place("A place", neighborhood="Zuma")
+        self.make_place("B place", neighborhood="alamo")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.order_of(out, ["alamo", "Zuma"]), ["alamo", "Zuma"])
+
+    def test_two_neighborhoods_differing_only_by_case_have_a_fixed_order(self):
+        """``Soma`` and ``soma`` are separate rows -- ``Place.neighborhood``
+        has no ``NOCASE`` collation, so the database groups them apart -- and
+        they tie on count *and* on the case-insensitive name key. Nothing but
+        the final case-sensitive tiebreak separates them, and without it
+        SQLite's row order for fully-tied keys is unspecified: the report
+        would be free to swap the two rows between runs.
+        """
+        for index in range(2):
+            self.make_place(f"Upper {index}", neighborhood="Soma")
+        for index in range(2):
+            self.make_place(f"Lower {index}", neighborhood="soma")
+
+        runs = [self.run_stats()[0] for _ in range(4)]
+
+        for out in runs:
+            with self.subTest(out=out):
+                self.assertEqual(self.row_count(out, "Soma"), 2)
+                self.assertEqual(self.row_count(out, "soma"), 2)
+                # Uppercase first: the tiebreak sorts the stored spelling, and
+                # SQLite compares those bytes with `S` below `s`.
+                self.assertEqual(
+                    self.order_of(out, ["Soma", "soma"]), ["Soma", "soma"]
+                )
+        self.assertEqual(len(set(runs)), 1)
+
+    def test_the_blank_row_is_last_even_when_it_has_the_largest_count(self):
+        for index in range(5):
+            self.make_place(f"Nameless {index}", neighborhood="")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, NO_NEIGHBORHOOD_ROW), 5)
+        self.assertEqual(
+            self.order_of(out, ["Mission", NO_NEIGHBORHOOD_ROW]),
+            ["Mission", NO_NEIGHBORHOOD_ROW],
+        )
+
+    def test_the_blank_row_is_last_among_several_neighborhoods(self):
+        for index in range(3):
+            self.make_place(f"Nameless {index}", neighborhood="")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Nopalito", neighborhood="Soma")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertTrue(rows[-1].startswith(NO_NEIGHBORHOOD_ROW), rows)
+
+
+class StatsTagTests(StatsCommandTestCase):
+    """The tag section: distinct places per tag, ordered, capped at five."""
+
+    def tag_rows(self, out):
+        return self.section_rows(out, _stats_module().TAGS_HEADING)
+
+    def test_each_tag_row_counts_the_distinct_places_carrying_it(self):
+        self.make_place("Blue Bottle", tags=["coffee", "wifi"])
+        self.make_place("Tartine", tags=["coffee"])
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "coffee"), 2)
+        self.assertEqual(self.row_count(out, "wifi"), 1)
+
+    def test_tags_are_ordered_by_count_then_name(self):
+        """Issue #9's worked example: ramen=2, coffee=2, park=1 prints as
+        coffee, ramen, park."""
+        self.make_place("Ramen One", tags=["ramen"])
+        self.make_place("Ramen Two", tags=["ramen"])
+        self.make_place("Coffee One", tags=["coffee"])
+        self.make_place("Coffee Two", tags=["coffee"])
+        self.make_place("Dolores", tags=["park"])
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(
+            self.order_of(out, ["coffee", "ramen", "park"]),
+            ["coffee", "ramen", "park"],
+        )
+
+    def test_the_tag_name_tie_break_is_ascending_not_descending(self):
+        """Created so that only an ascending tie-break gives this order."""
+        self.make_place("Zed", tags=["zzz"])
+        self.make_place("Ay", tags=["aaa"])
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.order_of(out, ["aaa", "zzz"]), ["aaa", "zzz"])
+
+    def test_at_most_five_tags_are_shown(self):
+        place = self.make_place("Everything")
+        for index in range(7):
+            place.tags.add(Tag.objects.create(name=f"tag{index}"))
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(len(self.tag_rows(out)), 5)
+
+    def test_fewer_than_five_tags_are_all_shown(self):
+        place = self.make_place("Three Tags")
+        for name in ("coffee", "ramen", "park"):
+            place.tags.add(Tag.objects.create(name=name))
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(len(self.tag_rows(out)), 3)
+
+    def test_the_cut_at_five_breaks_ties_by_name(self):
+        """Six tags, all on one place, so all six tie on count. The cut must
+        keep the five alphabetically first and drop the sixth -- and do it the
+        same way on every run."""
+        place = self.make_place("Everything")
+        for name in ("alpha", "bravo", "charlie", "delta", "echo", "foxtrot"):
+            place.tags.add(Tag.objects.create(name=name))
+
+        first, _ = self.run_stats()
+        second, _ = self.run_stats()
+
+        rows = self.tag_rows(first)
+        self.assertEqual(len(rows), 5)
+        self.assertTrue(self.has_row(first, "echo"), first)
+        self.assertFalse(self.has_row(first, "foxtrot"), first)
+        self.assertEqual(self.tag_rows(second), rows)
+
+    def test_the_cut_at_five_keeps_the_higher_count_over_the_name(self):
+        """Count beats name: a late-alphabet tag on two places outranks an
+        early-alphabet tag on one."""
+        for index in range(2):
+            self.make_place(f"Zed {index}", tags=["zulu"])
+        place = self.make_place("Everything")
+        for name in ("alpha", "bravo", "charlie", "delta", "echo"):
+            place.tags.add(Tag.objects.create(name=name))
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "zulu"), 2)
+        self.assertEqual(self.order_of(out, ["zulu", "alpha"]), ["zulu", "alpha"])
+        self.assertFalse(self.has_row(out, "echo"), out)
+
+    def test_a_tag_no_place_uses_is_never_listed(self):
+        self.make_place("Blue Bottle", tags=["coffee"])
+        Tag.objects.create(name="unused")
+
+        out, _ = self.run_stats()
+
+        self.assertNotIn("unused", out)
+        self.assertEqual(len(self.tag_rows(out)), 1)
+
+    def test_places_with_no_tags_at_all_get_a_line_not_an_empty_section(self):
+        self.make_place("Bare Bar", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        rows = self.tag_rows(out)
+        self.assertEqual(len(rows), 1)
+        self.assertIn("No tags used yet", rows[0])
+
+    def test_the_no_tags_line_is_not_a_zero_row(self):
+        self.make_place("Bare Bar")
+        Tag.objects.create(name="unused")
+
+        out, _ = self.run_stats()
+
+        self.assertFalse(self.has_row(out, "unused"), out)
+
+
+class StatsFormattingTests(StatsCommandTestCase):
+    """Readable columns, without pinning the padding itself."""
+
+    def test_a_long_neighborhood_name_does_not_push_lines_past_eighty_columns(self):
+        self.make_place("Long One", neighborhood="X" * 100)
+        self.make_place("Short One", neighborhood="Soma")
+        self.make_place("Other", neighborhood="Nob Hill")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        for row in rows:
+            if len(row) < 80:
+                continue
+            # Only the over-long name itself may exceed the terminal; every
+            # other row must stay inside it rather than being padded to match.
+            self.assertTrue(row.startswith("X" * 100), row)
+
+    def test_short_rows_stay_short_when_one_name_is_very_long(self):
+        self.make_place("Long One", neighborhood="X" * 100)
+        self.make_place("Short One", neighborhood="Soma")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        short = [row for row in rows if row.startswith("Soma")]
+        self.assertEqual(len(short), 1)
+        self.assertLess(len(short[0]), 80)
+
+    def test_every_row_carries_its_count_on_its_own_line(self):
+        self.make_place("Blue Bottle", neighborhood="Mission", tags=["coffee"])
+
+        out, _ = self.run_stats()
+
+        for heading in (
+            _stats_module().NEIGHBORHOOD_HEADING,
+            _stats_module().TAGS_HEADING,
+        ):
+            for row in self.section_rows(out, heading):
+                with self.subTest(row=row):
+                    self.assertTrue(row.rsplit(None, 1)[-1].isdigit(), row)
+
+
+class StatsQueryCountTests(StatsCommandTestCase):
+    """A report whose cost grows with the journal is a report I stop running."""
+
+    def populate(self, count, offset=0):
+        """``count`` places spread across many neighborhoods and many tags."""
+        for index in range(offset, offset + count):
+            self.make_place(
+                f"Place {index}",
+                neighborhood=f"Neighborhood {index % 7}",
+                status=(
+                    Place.Status.VISITED if index % 2 else Place.Status.WISHLIST
+                ),
+                tags=[f"tag{index % 9}", f"tag{(index + 3) % 9}"],
+            )
+
+    def queries_for_a_report(self):
+        with CaptureQueriesContext(connection) as captured:
+            self.run_stats()
+        return len(captured)
+
+    def test_the_budget_is_the_one_issue_nine_sets(self):
+        self.assertLessEqual(STATS_QUERIES, STATS_QUERY_BUDGET)
+
+    def test_the_query_count_is_fixed_with_three_places(self):
+        self.populate(3)
+
+        with self.assertNumQueries(STATS_QUERIES):
+            self.run_stats()
+
+    def test_the_query_count_is_the_same_with_thirty_places(self):
+        self.populate(30)
+
+        with self.assertNumQueries(STATS_QUERIES):
+            self.run_stats()
+
+    def test_the_query_count_does_not_grow_with_the_journal(self):
+        self.populate(3)
+        few = self.queries_for_a_report()
+
+        self.populate(27, offset=3)
+        many = self.queries_for_a_report()
+
+        self.assertEqual(few, many)
+        self.assertLessEqual(many, STATS_QUERY_BUDGET)
+
+    def test_the_empty_report_costs_no_more_than_the_full_one(self):
+        with self.assertNumQueries(1):
+            self.run_stats()
+
+
+class StatsWorkedExampleTests(StatsCommandTestCase):
+    """One populated journal, read end to end the way issue #9 describes it."""
+
+    def setUp(self):
+        self.make_place(
+            "Blue Bottle",
+            neighborhood="Mission",
+            status=Place.Status.VISITED,
+            tags=["coffee", "wifi", "cheap"],
+        )
+        self.make_place(
+            "Tartine", neighborhood="Mission", status=Place.Status.VISITED,
+            tags=["coffee"],
+        )
+        self.make_place("Nopalito", neighborhood="Soma", status=Place.Status.VISITED)
+        self.make_place("Ippudo", neighborhood="Soma", tags=["ramen"])
+        self.make_place("Mystery Bar", neighborhood="", tags=["cheap"])
+
+    def test_the_whole_report_reads_correctly(self):
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, "total places"), 5)
+        self.assertEqual(self.row_count(out, "visited"), 3)
+        self.assertEqual(self.row_count(out, "wishlist"), 2)
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 2)
+        self.assertEqual(self.row_count(out, "Mission"), 2)
+        self.assertEqual(self.row_count(out, "Soma"), 2)
+        self.assertEqual(self.row_count(out, NO_NEIGHBORHOOD_ROW), 1)
+        self.assertEqual(self.row_count(out, "coffee"), 2)
+        self.assertEqual(self.row_count(out, "cheap"), 2)
+        self.assertEqual(self.row_count(out, "ramen"), 1)
+        self.assertEqual(self.row_count(out, "wifi"), 1)
+
+    def test_the_neighborhood_rows_are_in_the_documented_order(self):
+        out, _ = self.run_stats()
+
+        self.assertEqual(
+            self.order_of(out, ["Mission", "Soma", NO_NEIGHBORHOOD_ROW]),
+            ["Mission", "Soma", NO_NEIGHBORHOOD_ROW],
+        )
+
+    def test_the_tag_rows_are_in_the_documented_order(self):
+        out, _ = self.run_stats()
+
+        self.assertEqual(
+            self.order_of(out, ["cheap", "coffee", "ramen", "wifi"]),
+            ["cheap", "coffee", "ramen", "wifi"],
+        )
