@@ -116,11 +116,35 @@ Determinism
 -----------
 
 Scoring is deterministic: no randomness, no clock, no reliance on ``set`` or
-``dict`` iteration order or on ``PYTHONHASHSEED``. **Ties are broken by
-lowercased name, ascending**, so equal scores order the same way on every run
--- which also fixes *which* three the fallback picks when candidates 3, 4 and
-5 all score alike. Output order therefore depends only on the candidates' own
-data, never on their position in the input.
+``dict`` iteration order or on ``PYTHONHASHSEED``. Equal scores order the same
+way on every run, which also fixes *which* three the fallback picks when
+candidates 3, 4 and 5 all score alike.
+
+**The tie-break chain, in the order it applies:**
+
+1. ``score``, descending -- the ranking proper.
+2. ``name``, ascending.
+3. ``neighborhood``, ascending.
+4. ``note``, ascending.
+5. the candidate's ``tags``, ascending: their names sorted, then compared as
+   a sequence, so two candidates carrying the same tags in a different order
+   are not separated by that difference.
+
+Keys 2-5 are each stripped and lowercased, so the chain is insensitive to
+case and to surrounding whitespace, exactly as scoring is. Every one of them
+is **read off the candidate's own data** -- never its position in the input --
+so ``rank_places(q, [a, b])`` and ``rank_places(q, [b, a])`` return the same
+order. That matters because duplicate names are allowed by design (two
+branches of one chain in different neighborhoods), and name alone stops
+separating them; ``neighborhood``, ``note`` and ``tags`` carry on from there.
+
+The chain runs out when two candidates are identical in every scored field.
+Those come back in an unspecified order relative to each other -- **no
+exception is raised, and nothing else is consulted to break the tie**. There
+is no data left to break it with, and reaching for input position would be
+position dependence under another name. Two candidates that far identical are
+interchangeable in the output anyway: whichever way they land, the printed
+lines are the same.
 
 Each candidate handed in produces exactly one result; this module neither
 deduplicates the input nor invents entries.
@@ -222,7 +246,7 @@ def rank_places(query, candidates):
         return RankedResults(results=(), is_weak=False)
 
     scored = [(_score(query_tokens, place), place) for place in candidates]
-    scored.sort(key=lambda pair: (-pair[0], _sort_name(pair[1])))
+    scored.sort(key=lambda pair: (-pair[0], _tie_break_key(pair[1])))
 
     strong = [pair for pair in scored if pair[0] >= STRONG_MATCH_THRESHOLD]
     if strong:
@@ -333,6 +357,30 @@ def _tag_names(place):
     return tuple(names)
 
 
-def _sort_name(place):
-    """The tie-break key: the candidate's name, lowercased."""
-    return _text(place, "name").strip().lower()
+def _tie_break_key(place):
+    """The tie-break key for one candidate: every scored field, in chain order.
+
+    Name, then neighborhood, then note, then the candidate's tag names sorted
+    -- see "Determinism" in the module docstring. Each text component is
+    stripped and lowercased, matching how scoring reads the same fields, and
+    the tag names are sorted inside the key so that two candidates carrying
+    the same tags in a different order compare equal rather than being
+    separated by the order they happened to be listed in.
+
+    Every component comes from the candidate's own data. Nothing here reads
+    the candidate's index in the input, so the caller's ordering cannot reach
+    the output. Two candidates identical in all four fields therefore produce
+    equal keys and keep whatever relative order Python's stable sort gives
+    them; that is the documented end of the chain, not an error.
+    """
+    return (
+        _sort_text(place, "name"),
+        _sort_text(place, "neighborhood"),
+        _sort_text(place, "note"),
+        tuple(sorted(name.strip().lower() for name in _tag_names(place))),
+    )
+
+
+def _sort_text(place, attribute):
+    """One text component of the tie-break key: stripped and lowercased."""
+    return _text(place, attribute).strip().lower()

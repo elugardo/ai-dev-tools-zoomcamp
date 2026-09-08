@@ -1,5 +1,6 @@
 import ast
 import inspect
+import itertools
 import random
 import unittest
 import warnings
@@ -2298,6 +2299,243 @@ class SearchDeterminismTests(unittest.TestCase):
             sorted(candidate.name for candidate in candidates)[:3],
             "test data must distinguish a lowercased sort from an ASCII one",
         )
+
+
+class SearchDuplicateNameOrderTests(unittest.TestCase):
+    """Issue #16: the tie-break chain past the name.
+
+    ``add`` allows duplicate names by design -- it warns and proceeds -- so two
+    branches of one chain in different neighborhoods is an ordinary journal,
+    not a contrived one. Tying on score *and* on the lowercased name used to
+    leave Python's stable sort falling through to input order, which made
+    ``rank_places(q, [a, b])`` and ``rank_places(q, [b, a])`` disagree.
+
+    Every candidate below is named ``Blue Bottle`` and scores exactly 90.0
+    against ``"blue bottle"``, so the name key is spent before the assertion
+    starts and only the key under test can order them. Each test walks *every*
+    permutation of its candidates, so a key that stops being consulted falls
+    back to input order and is contradicted by at least one permutation --
+    which is what makes these fail on mutation rather than merely pass.
+    """
+
+    QUERY = "blue bottle"
+
+    #: A query no field of any candidate here can match, so every score is 0
+    #: and the weak fallback decides which three come back.
+    MISS = "zzzzqqq"
+
+    def orders(self, query, candidates):
+        """The output name/neighborhood/note order for every input permutation."""
+        return [
+            [
+                (result.place.name, result.place.neighborhood, result.place.note)
+                for result in search.rank_places(query, list(order))
+            ]
+            for order in itertools.permutations(candidates)
+        ]
+
+    def assertOneOrderFor(self, query, candidates):
+        """Every permutation of ``candidates`` ranks identically. Returns it."""
+        orders = self.orders(query, candidates)
+        for order in orders[1:]:
+            self.assertEqual(order, orders[0])
+        return orders[0]
+
+    def assertAllTied(self, query, candidates):
+        """Guard: the data must actually tie, or the test proves nothing."""
+        scores = {result.score for result in search.rank_places(query, candidates)}
+        self.assertEqual(len(scores), 1, "candidates must tie on score")
+
+    def test_two_places_sharing_a_name_rank_the_same_whichever_order_they_arrive(self):
+        """The defect, stated directly: same name, same score, opposite inputs."""
+        mitte = place("Blue Bottle", "pour over", "Mitte", ["coffee"])
+        kreuzberg = place("Blue Bottle", "pour over", "Kreuzberg", ["coffee"])
+
+        self.assertAllTied(self.QUERY, [mitte, kreuzberg])
+        forwards = search.rank_places(self.QUERY, [mitte, kreuzberg])
+        backwards = search.rank_places(self.QUERY, [kreuzberg, mitte])
+
+        self.assertEqual(
+            [result.place for result in forwards],
+            [result.place for result in backwards],
+        )
+        self.assertEqual(
+            [result.place.neighborhood for result in forwards], ["Kreuzberg", "Mitte"]
+        )
+
+    def test_the_neighborhood_breaks_a_tie_the_name_cannot(self):
+        """Three same-named places differing only in neighborhood, all six
+        permutations. Without the neighborhood key each permutation comes back
+        in the order it was handed in, so the six disagree."""
+        candidates = [
+            place("Blue Bottle", "pour over", hood, ["coffee"])
+            for hood in ("Mitte", "Kreuzberg", "Wedding")
+        ]
+
+        self.assertAllTied(self.QUERY, candidates)
+        ranked = self.assertOneOrderFor(self.QUERY, candidates)
+
+        self.assertEqual(
+            [hood for _, hood, _ in ranked], ["Kreuzberg", "Mitte", "Wedding"]
+        )
+
+    def test_the_note_breaks_a_tie_the_name_and_neighborhood_cannot(self):
+        """Same name, same neighborhood: the chain has to reach the note."""
+        candidates = [
+            place("Blue Bottle", note, "Mitte", ["coffee"])
+            for note in ("quiet upstairs", "always packed", "the good one")
+        ]
+
+        self.assertAllTied(self.QUERY, candidates)
+        ranked = self.assertOneOrderFor(self.QUERY, candidates)
+
+        self.assertEqual(
+            [note for _, _, note in ranked],
+            ["always packed", "quiet upstairs", "the good one"],
+        )
+
+    def test_the_tags_break_a_tie_nothing_earlier_in_the_chain_can(self):
+        """Identical name, neighborhood and note; only the tags differ, so the
+        last link of the chain is the only one left that can order these."""
+        candidates = [
+            place("Blue Bottle", "pour over", "Mitte", [tag])
+            for tag in ("wifi", "armchairs", "outdoor")
+        ]
+
+        self.assertAllTied(self.QUERY, candidates)
+        rankings = [
+            [
+                tuple(result.place.tags)
+                for result in search.rank_places(self.QUERY, list(order))
+            ]
+            for order in itertools.permutations(candidates)
+        ]
+
+        for ranking in rankings[1:]:
+            self.assertEqual(ranking, rankings[0])
+        self.assertEqual(
+            rankings[0], [("armchairs",), ("outdoor",), ("wifi",)]
+        )
+
+    def test_the_tie_break_ignores_the_case_of_the_secondary_keys(self):
+        """The chain lowercases past the name too: a raw ASCII sort puts every
+        capital ahead of every lowercase letter and would answer the other way
+        round."""
+        upper = place("Blue Bottle", "pour over", "Zulu", ["coffee"])
+        lower = place("Blue Bottle", "pour over", "altona", ["coffee"])
+
+        self.assertAllTied(self.QUERY, [upper, lower])
+        ranked = self.assertOneOrderFor(self.QUERY, [upper, lower])
+
+        self.assertEqual([hood for _, hood, _ in ranked], ["altona", "Zulu"])
+        self.assertNotEqual(
+            [hood for _, hood, _ in ranked],
+            sorted(candidate.neighborhood for candidate in (upper, lower)),
+            "test data must distinguish a lowercased sort from an ASCII one",
+        )
+
+    def test_the_tie_break_ignores_whitespace_around_the_secondary_keys(self):
+        """Padding is not data: a space precedes every letter in an unstripped
+        sort, so ``"  Zulu "`` would come first if the key kept it."""
+        padded = place("Blue Bottle", "pour over", "  Zulu ", ["coffee"])
+        plain = place("Blue Bottle", "pour over", "altona", ["coffee"])
+
+        self.assertAllTied(self.QUERY, [padded, plain])
+        ranked = self.assertOneOrderFor(self.QUERY, [padded, plain])
+
+        self.assertEqual([hood for _, hood, _ in ranked], ["altona", "  Zulu "])
+
+    def test_the_tag_key_does_not_depend_on_the_order_the_tags_were_listed(self):
+        """The tag key sorts the names inside itself, so the listing order of a
+        many-to-many is not data.
+
+        The two tag sets discriminate: sorted, ``armchairs, wifi`` precedes
+        ``bar``; left in the order they were listed, ``wifi, armchairs``
+        follows it. So the answer below is the sorted key's answer and only
+        the sorted key's answer."""
+        listed = place("Blue Bottle", "pour over", "Mitte", ["wifi", "armchairs"])
+        other = place("Blue Bottle", "pour over", "Mitte", ["bar"])
+
+        self.assertAllTied(self.QUERY, [listed, other])
+        for order in ([listed, other], [other, listed]):
+            ranked = [
+                result.place for result in search.rank_places(self.QUERY, order)
+            ]
+
+            self.assertEqual(ranked, [listed, other])
+
+    def test_a_tag_row_and_a_plain_string_tie_break_identically(self):
+        """The key reads tag *names*, the way scoring does, so a ``Tag`` row and
+        the same name as a bare string are one value here too."""
+        rows = place("Blue Bottle", "pour over", "Mitte", [TagRow("wifi")])
+        strings = place("Blue Bottle", "pour over", "Mitte", ["zebra"])
+
+        ranked = [
+            result.place for result in search.rank_places(self.QUERY, [strings, rows])
+        ]
+
+        self.assertEqual(ranked, [rows, strings])
+
+    def test_candidates_identical_in_every_scored_field_come_back_without_raising(self):
+        """The documented end of the chain. Nothing separates these, and the
+        module says so rather than inventing a key: both come back, scored the
+        same, and no exception is raised."""
+        twins = [
+            place("Blue Bottle", "pour over", "Mitte", ["coffee"]) for _ in range(2)
+        ]
+
+        results = search.rank_places(self.QUERY, twins)
+
+        self.assertEqual(len(results), 2)
+        self.assertEqual(
+            {id(result.place) for result in results}, {id(twin) for twin in twins}
+        )
+        self.assertEqual(len({result.score for result in results}), 1)
+
+    def test_the_docstring_says_identical_candidates_are_not_separated(self):
+        """Criterion: "say so in the docstring rather than leaving it implied."
+        Asserted on the docstring because the docstring *is* the deliverable
+        here -- no code path is being measured by proxy."""
+        doc = search.__doc__.lower()
+
+        self.assertIn("identical in every scored field", doc)
+        self.assertIn("unspecified order", doc)
+
+    def test_the_docstring_lists_the_tie_break_chain_in_the_order_it_applies(self):
+        """Criterion: the chain is documented in the order it applies -- so the
+        assertion is on the documented order of those field names, which is the
+        thing the criterion is about."""
+        doc = search.__doc__.lower()
+        chain = doc[doc.index("the tie-break chain") :]
+        positions = [
+            chain.index(key)
+            for key in ("score", "name", "neighborhood", "note", "tags")
+        ]
+
+        self.assertEqual(positions, sorted(positions))
+
+    def test_duplicate_names_also_settle_which_three_the_fallback_picks(self):
+        """One level up, where the tie-break chooses *which* places come back
+        rather than merely their order: five same-named candidates, every score
+        0, and the weak fallback keeps three."""
+        candidates = [
+            place("Blue Bottle", "pour over", hood, ["coffee"])
+            for hood in ("echo", "alpha", "delta", "bravo", "charlie")
+        ]
+
+        for order in (
+            candidates,
+            list(reversed(candidates)),
+            candidates[2:] + candidates[:2],
+            [candidates[index] for index in (3, 0, 4, 1, 2)],
+        ):
+            results = search.rank_places(self.MISS, order)
+
+            self.assertTrue(results.is_weak)
+            self.assertEqual(
+                [result.place.neighborhood for result in results],
+                ["alpha", "bravo", "charlie"],
+            )
 
 
 # ---------------------------------------------------------------------------
