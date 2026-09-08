@@ -5425,6 +5425,32 @@ class StatsNeighborhoodOrderingTests(StatsCommandTestCase):
 
         self.assertEqual(self.order_of(out, ["alamo", "Zuma"]), ["alamo", "Zuma"])
 
+    def test_two_neighborhoods_differing_only_by_case_have_a_fixed_order(self):
+        """``Soma`` and ``soma`` are separate rows -- ``Place.neighborhood``
+        has no ``NOCASE`` collation, so the database groups them apart -- and
+        they tie on count *and* on the case-insensitive name key. Nothing but
+        the final case-sensitive tiebreak separates them, and without it
+        SQLite's row order for fully-tied keys is unspecified: the report
+        would be free to swap the two rows between runs.
+        """
+        for index in range(2):
+            self.make_place(f"Upper {index}", neighborhood="Soma")
+        for index in range(2):
+            self.make_place(f"Lower {index}", neighborhood="soma")
+
+        runs = [self.run_stats()[0] for _ in range(4)]
+
+        for out in runs:
+            with self.subTest(out=out):
+                self.assertEqual(self.row_count(out, "Soma"), 2)
+                self.assertEqual(self.row_count(out, "soma"), 2)
+                # Uppercase first: the tiebreak sorts the stored spelling, and
+                # SQLite compares those bytes with `S` below `s`.
+                self.assertEqual(
+                    self.order_of(out, ["Soma", "soma"]), ["Soma", "soma"]
+                )
+        self.assertEqual(len(set(runs)), 1)
+
     def test_the_blank_row_is_last_even_when_it_has_the_largest_count(self):
         for index in range(5):
             self.make_place(f"Nameless {index}", neighborhood="")
