@@ -261,8 +261,10 @@ Before trusting any of the above, check your install:
 uv run python manage.py test
 ```
 
-A green run ends like this (the per-test progress dots above these lines are
-omitted here, and the elapsed time depends on your machine):
+A green run finishes with this summary (the per-test progress dots above it are
+omitted here, and the elapsed time depends on your machine). A line about
+destroying the test database is printed after it — that is teardown, not
+trouble:
 
 ```
 ----------------------------------------------------------------------
