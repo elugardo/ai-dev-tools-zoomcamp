@@ -47,6 +47,14 @@ from places.models import Place, Tag, normalize_tag_name
 # comments never reach the tree at all, and the docstrings that do are excluded
 # where it matters (see `_string_constants`). Reach for these helpers rather
 # than for `getsource()` when adding a source rule.
+#
+# Know the limit of the technique, though: a parse tree says what the code
+# *says*, not what it *runs*. Nothing here distinguishes reachable code from
+# dead code, so a call sitting under `if False:` -- or in a branch no input can
+# reach -- satisfies a positive assertion just as a live one does. Where the
+# rule is about what actually happens at runtime rather than about which
+# mechanism the module reuses, a behavioral test is the one that proves it, and
+# these rules are a complement to those tests rather than a substitute.
 
 
 def _module_tree(module):
@@ -2917,13 +2925,19 @@ class LookupModuleContractTests(SimpleTestCase):
         self.assertNotIn("rank_places", _called_names(_lookup_module()))
 
     def test_both_commands_import_the_shared_module_rather_than_copying_it(self):
-        """Imports and definitions, not text.
+        """Imports, definitions *and* the call, not text.
 
         Copying is exactly what this test exists to prevent, and a pasted copy
         leaves the docstring's "comes from ``places.lookup``" in place -- which
         is how a text assertion was defeated by the very mutation it guarded
-        against. So: the name has to arrive through an ``import``, and the
+        against. So the name has to arrive through an ``import`` and the
         command must not define one of its own.
+
+        The call is the third assertion because the first two are not enough:
+        an import that is retained but never used, next to a pasted copy under
+        a different name, satisfies both while the command renders from its own
+        code. An unused import is not a dependency -- it is a comment that
+        happens to parse.
         """
         for module, borrowed in (
             (_visit_module(), "resolve_place"),
@@ -2933,6 +2947,7 @@ class LookupModuleContractTests(SimpleTestCase):
                 self.assertIn("places.lookup", _imported_modules(module))
                 self.assertIn(borrowed, _imported_names(module, "places.lookup"))
                 self.assertNotIn(borrowed, _defined_functions(module))
+                self.assertIn(borrowed, _called_names(module))
 
     def test_neither_command_reimplements_name_matching(self):
         """``visit`` resolves through the helper; the lookups themselves must
