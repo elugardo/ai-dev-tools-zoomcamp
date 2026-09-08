@@ -27,12 +27,22 @@ Design notes worth keeping in view:
   keys even so. The tag section is the only place a join happens, and there
   it counts distinct *places* per tag.
 * **Blank neighborhoods are a bucket, not a hole.** A place whose
-  ``neighborhood`` is empty -- or is only spaces, which ``Trim`` folds to the
-  same thing -- lands under :data:`NO_NEIGHBORHOOD_LABEL`, printed last, and
-  is deliberately *not* a neighborhood "touched": I have not reached a
-  neighborhood by failing to name one. So the breakdown always sums to the
-  total while the touched count does not count that row. Nothing here changes
-  how blanks are *stored*; issue #9 puts that out of scope.
+  ``neighborhood`` is blank lands under :data:`NO_NEIGHBORHOOD_LABEL`,
+  printed last, and is deliberately *not* a neighborhood "touched": I have
+  not reached a neighborhood by failing to name one. So the breakdown always
+  sums to the total while the touched count does not count that row.
+* **What counts as blank is decided on write, not here.** ``Place.save``
+  runs every free-text column through ``places.models.normalize_text``
+  (issue #23), so a neighborhood of tabs, newlines or spaces is stored as
+  ``""`` and a padded ``"	Mission
+"`` is stored as ``Mission``. This
+  command therefore does not have to define "blank" itself, and neither do
+  ``todo``, ``surprise`` or ``find``. The ``Trim`` below is a residual safety
+  net for rows that reached the table without going through ``save()`` at
+  all -- a ``QuerySet.update()`` or raw SQL -- and *not* a second statement
+  of the rule: it is SQLite's ``TRIM()``, which strips ``U+0020`` and nothing
+  else, so it could never have been the rule in the first place. That
+  mismatch is what issue #23 was.
 * **Ordering is total, so two runs on the same data print the same screen.**
   Count descending, then name ascending, then a last tiebreak that cannot
   tie. Without it the tag cut at five would depend on whatever order SQLite
@@ -154,6 +164,9 @@ class Command(BaseCommand):
         it is not a neighborhood I have been to. Dropping the exclude would
         report one neighborhood too many the moment a single place is
         recorded without one.
+
+        Blank has already been decided by ``Place.save`` before the row got
+        here; ``Trim`` only catches a space-padded row that bypassed it.
         """
         return (
             Place.objects.annotate(trimmed=Trim("neighborhood"))

@@ -24,7 +24,7 @@ from django.urls import reverse
 from django.utils import timezone as django_timezone
 
 from places import search
-from places.models import Place, Tag, normalize_tag_name
+from places.models import Place, Tag, normalize_tag_name, normalize_text
 
 # ---------------------------------------------------------------------------
 # Shared AST helpers, used by every source-rule test in this file (issue #21)
@@ -5921,3 +5921,437 @@ class StatsWorkedExampleTests(StatsCommandTestCase):
             self.order_of(out, ["cheap", "coffee", "ramen", "wifi"]),
             ["cheap", "coffee", "ramen", "wifi"],
         )
+
+
+# ---------------------------------------------------------------------------
+# Issue #23 -- whitespace normalization on write
+# ---------------------------------------------------------------------------
+#
+# SQLite's `TRIM()` -- what Django's `Trim` compiles to -- strips U+0020 and
+# nothing else. Python's `str.strip()` strips tabs, newlines and every other
+# Unicode space. Any comparison that trims on one side in SQL and the other in
+# Python therefore disagrees with itself.
+#
+# The fix is shape A from the issue: `Place.save` normalizes, so the column
+# never holds the disputed value and every reader inherits the guarantee. The
+# tests below are deliberately *behavioral* -- what the database holds, what a
+# command prints -- rather than assertions about which function `models.py`
+# calls. Breaking the normalization has to break them.
+
+#: Values that Python considers blank but SQLite's `TRIM()` does not. `"   "`
+#: is included as the control: it is the one case that worked before, so a
+#: test that only used spaces would have passed against the bug.
+BLANK_WHITESPACE = ("\t", "\n", "  \t\n ", "\r", " ", "   ")
+
+#: Meaningful text wearing whitespace that `TRIM()` cannot remove.
+PADDED_NEIGHBORHOODS = ("\tMission\n", "\nMission", "Mission\t", " \t Mission \n ")
+
+
+class NormalizeTextTests(unittest.TestCase):
+    """The rule itself: stripped, never ``None``, inner spacing untouched."""
+
+    def test_none_becomes_the_empty_string_not_none(self):
+        """Issue #2: these columns are ``blank=True`` without ``null=True``,
+        so "no value" is ``""`` and NULL is not a value the model can hold."""
+        self.assertEqual(normalize_text(None), "")
+
+    def test_whitespace_only_values_become_empty(self):
+        for raw in BLANK_WHITESPACE:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_text(raw), "")
+
+    def test_surrounding_whitespace_is_removed_from_real_text(self):
+        for raw in PADDED_NEIGHBORHOODS:
+            with self.subTest(raw=raw):
+                self.assertEqual(normalize_text(raw), "Mission")
+
+    def test_inner_whitespace_is_left_alone(self):
+        """Only the ends are normalized -- ``Nob Hill`` is not ``NobHill``,
+        and a two-line note keeps its line break."""
+        self.assertEqual(normalize_text("  Nob Hill  "), "Nob Hill")
+        self.assertEqual(
+            normalize_text("\nline one\nline two\n"), "line one\nline two"
+        )
+
+    def test_an_already_canonical_value_is_returned_unchanged(self):
+        self.assertEqual(normalize_text("Mission"), "Mission")
+        self.assertEqual(normalize_text(""), "")
+
+    def test_case_is_not_folded(self):
+        """Unlike ``normalize_tag_name``: the stored spelling of a
+        neighborhood is what gets echoed back to the user."""
+        self.assertEqual(normalize_text("  MISSION  "), "MISSION")
+
+
+class PlaceTextNormalizationTests(TestCase):
+    """The guarantee at the model: whatever writes, the row comes out canonical.
+
+    Read back with ``.values_list`` rather than off the instance, so what is
+    asserted is what SQLite actually holds.
+    """
+
+    def stored(self, place, field="neighborhood"):
+        """The value in the database column, fetched fresh."""
+        return Place.objects.filter(pk=place.pk).values_list(field, flat=True)[0]
+
+    def test_create_normalizes_a_whitespace_only_neighborhood_to_empty(self):
+        for raw in BLANK_WHITESPACE:
+            with self.subTest(raw=raw):
+                place = Place.objects.create(name="Nameless", neighborhood=raw)
+                self.assertEqual(self.stored(place), "")
+
+    def test_create_strips_a_padded_neighborhood(self):
+        for raw in PADDED_NEIGHBORHOODS:
+            with self.subTest(raw=raw):
+                place = Place.objects.create(name="Blue Bottle", neighborhood=raw)
+                self.assertEqual(self.stored(place), "Mission")
+
+    def test_save_on_an_existing_place_normalizes_too(self):
+        """The second write is normalized as well as the first -- otherwise
+        an edit could reintroduce exactly what ``create`` cleaned out."""
+        place = Place.objects.create(name="Blue Bottle", neighborhood="Mission")
+
+        place.neighborhood = "\tSoma\n"
+        place.save()
+
+        self.assertEqual(self.stored(place), "Soma")
+
+    def test_save_with_update_fields_still_normalizes_the_written_field(self):
+        """``visit`` saves with ``update_fields``; the guarantee must survive it."""
+        place = Place.objects.create(name="Blue Bottle")
+
+        place.note = "  great wifi \n"
+        place.save(update_fields=["note"])
+
+        self.assertEqual(self.stored(place, "note"), "great wifi")
+
+    def test_full_clean_normalizes_before_validation(self):
+        """``clean()`` runs during ``full_clean``, which is the path the admin
+        takes, so validation sees the value that will be stored."""
+        place = Place(name="  Blue Bottle  ", neighborhood="\tMission\n")
+
+        place.full_clean()
+
+        self.assertEqual(place.name, "Blue Bottle")
+        self.assertEqual(place.neighborhood, "Mission")
+
+    def test_the_instance_agrees_with_the_row_after_save(self):
+        """No surprise where the in-memory object still holds the raw text
+        while the database holds the stripped one."""
+        place = Place.objects.create(name="Blue Bottle", neighborhood="\tMission\n")
+
+        self.assertEqual(place.neighborhood, "Mission")
+        self.assertEqual(place.neighborhood, self.stored(place))
+
+    def test_a_blank_neighborhood_stays_an_empty_string_and_never_null(self):
+        """Issue #2's constraint, restated as a behavior: ``""`` in, ``""``
+        out -- and ``None`` in is coerced rather than hitting NOT NULL."""
+        blank = Place.objects.create(name="Nameless", neighborhood="")
+        self.assertEqual(self.stored(blank), "")
+
+        nulled = Place.objects.create(name="Also Nameless", neighborhood=None)
+        self.assertEqual(self.stored(nulled), "")
+        self.assertIsNone(
+            Place.objects.filter(neighborhood__isnull=True).first(),
+            "no place may hold NULL in a blank=True text column",
+        )
+
+    def test_the_same_rule_covers_the_other_free_text_columns(self):
+        """Stated explicitly rather than done silently, per issue #23's "out
+        of scope" note: the fix is one rule over ``Place``'s free text, so it
+        covers ``name``, ``address`` and ``note`` as well as ``neighborhood``.
+        ``name`` reads through the same shape of trimmed comparison in
+        ``places.lookup`` that ``neighborhood`` does in ``todo``."""
+        place = Place.objects.create(
+            name="\tBlue Bottle\n",
+            neighborhood="\tMission\n",
+            address="\t1 Main St\n",
+            note="\tgreat wifi\n",
+        )
+
+        self.assertEqual(self.stored(place, "name"), "Blue Bottle")
+        self.assertEqual(self.stored(place, "neighborhood"), "Mission")
+        self.assertEqual(self.stored(place, "address"), "1 Main St")
+        self.assertEqual(self.stored(place, "note"), "great wifi")
+
+    def test_a_note_keeps_its_inner_line_breaks(self):
+        """Stripping the ends is not collapsing the middle: a multi-line note
+        is still multi-line after the round trip."""
+        place = Place.objects.create(name="Tartine", note="\n line one\nline two \n")
+
+        self.assertEqual(self.stored(place, "note"), "line one\nline two")
+
+    def test_a_padded_and_a_plain_neighborhood_become_one_stored_value(self):
+        """The point of normalizing on write: two spellings, one value, so
+        every reader groups and filters them together without trying."""
+        Place.objects.create(name="Blue Bottle", neighborhood="Mission")
+        Place.objects.create(name="Tartine", neighborhood="\tMission\n")
+
+        self.assertEqual(
+            set(Place.objects.values_list("neighborhood", flat=True)), {"Mission"}
+        )
+        self.assertEqual(Place.objects.filter(neighborhood="Mission").count(), 2)
+
+    def test_a_padded_name_is_resolvable_by_its_plain_spelling(self):
+        """``places.lookup`` compares ``name__iexact`` against a
+        Python-stripped string, so a padded stored name was unreachable by
+        ``visit`` before this -- the same mismatch, one column over.
+
+        The second place is what makes this discriminate. Un-normalized, the
+        exact stage misses the padded name entirely and resolution falls
+        through to the substring stage, where both places match and ``visit``
+        refuses as ambiguous. Normalized, the exact stage matches one.
+        """
+        from places import lookup
+
+        place = Place.objects.create(name="\tBlue Bottle\n")
+        Place.objects.create(name="Blue Bottle Coffee")
+
+        self.assertEqual(lookup.resolve_place("Blue Bottle").pk, place.pk)
+
+    def test_tag_names_are_untouched_by_this(self):
+        """Issue #23 puts tag normalization out of scope -- it already has
+        ``normalize_tag_name`` and the ``NOCASE`` collation."""
+        tag = Tag.objects.create(name="  Coffee \n")
+        self.assertEqual(Tag.objects.get(pk=tag.pk).name, "coffee")
+
+
+class PlaceAdminWhitespaceTests(AdminTestCase):
+    """The third write path issue #23 names: the admin form.
+
+    Note for whoever mutation-tests this file: these two are **equivalent
+    mutants** with respect to ``Place.save``'s normalization. Django's
+    ``forms.CharField`` has ``strip=True`` and strips with Python's
+    ``str.strip()``, so the admin cleans a padded value before the model ever
+    sees it, and these pass with the model normalization removed. They are
+    here because the acceptance criterion asks for the guarantee to be pinned
+    at the admin surface, and because they would catch a regression that
+    turned that form-level stripping off. The discriminating tests are the
+    model and command ones above and below.
+    """
+
+    def test_a_padded_neighborhood_typed_into_the_form_is_stored_stripped(self):
+        response = self.client.post(
+            self.place_add_url,
+            self.place_form_data(name="Blue Bottle", neighborhood="\tMission\n"),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Place.objects.get().neighborhood, "Mission")
+
+    def test_a_whitespace_only_neighborhood_typed_into_the_form_is_stored_blank(self):
+        response = self.client.post(
+            self.place_add_url,
+            self.place_form_data(name="Nameless", neighborhood="\t\n"),
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(Place.objects.get().neighborhood, "")
+
+
+class StatsWhitespaceNeighborhoodTests(StatsCommandTestCase):
+    """``stats`` on the data QA reproduced in issue #23.
+
+    ``StatsBlankNeighborhoodTests`` above already covers spaces, which is the
+    one blank SQLite's ``TRIM()`` handled. These cover the ones it did not.
+    """
+
+    def test_a_tab_only_neighborhood_joins_the_no_neighborhood_bucket(self):
+        """The exact reproduction from the issue: one tab, one Mission."""
+        self.make_place("Nameless", neighborhood="\t")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        self.assertEqual(self.row_count(out, NO_NEIGHBORHOOD_ROW), 1)
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 1)
+
+    def test_every_kind_of_blank_lands_in_one_bucket(self):
+        for index, raw in enumerate(BLANK_WHITESPACE):
+            self.make_place(f"Nameless {index}", neighborhood=raw)
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            self.row_count(out, NO_NEIGHBORHOOD_ROW), len(BLANK_WHITESPACE)
+        )
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 1)
+
+    def test_no_breakdown_row_is_visually_blank(self):
+        """Every row carries a readable label, whatever was written. A row
+        printed for a tab-only value would strip down to its bare count."""
+        for index, raw in enumerate(BLANK_WHITESPACE):
+            self.make_place(f"Nameless {index}", neighborhood=raw)
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        for row in self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING):
+            with self.subTest(row=row):
+                label = row.rstrip("0123456789").strip()
+                self.assertNotEqual(label, "", f"blank-labelled row in:\n{out}")
+
+    def test_a_padded_neighborhood_is_grouped_under_its_plain_name(self):
+        """A neighborhood padded with tabs is Mission -- one row of two, not
+        two rows of one."""
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Tartine", neighborhood="\tMission\n")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(self.row_count(out, "Mission"), 2)
+        self.assertEqual(self.row_count(out, "Neighborhoods touched:"), 1)
+
+    def test_a_newline_in_a_neighborhood_cannot_split_the_report(self):
+        """A stored newline would print as an extra line and silently end the
+        breakdown section early, since a blank line closes it."""
+        self.make_place("Nameless", neighborhood="\nSoma\n")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_stats()
+
+        rows = self.section_rows(out, _stats_module().NEIGHBORHOOD_HEADING)
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(self.row_count(out, "Soma"), 1)
+
+
+class TodoWhitespaceFilterTests(TodoCommandTestCase):
+    """``todo --neighborhood`` matches the whole value, so padding is fatal.
+
+    The flag is Python-stripped by the command and compared with ``iexact``;
+    a stored neighborhood padded with tabs would not match it before #23.
+    """
+
+    def test_a_padded_neighborhood_is_still_found_by_its_plain_name(self):
+        self.make_place("Tartine", neighborhood="\tMission\n")
+
+        out, _ = self.run_todo("--neighborhood", "Mission")
+
+        self.assertIn("Tartine", out)
+
+    def test_a_whitespace_only_neighborhood_is_not_matched_by_a_real_one(self):
+        """It is blank, so it behaves exactly as an empty neighborhood does.
+
+        An equivalent mutant on its own -- a tab never equalled ``Mission``
+        either -- kept because the criterion asks for the "treated exactly as
+        ``""``" half of the behavior to be pinned, not only the padded half.
+        """
+        self.make_place("Nameless", neighborhood="\t")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_todo("--neighborhood", "Mission")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Nameless", out)
+
+    def test_a_padded_and_a_plain_place_are_listed_together(self):
+        self.make_place("Blue Bottle", neighborhood="Mission")
+        self.make_place("Tartine", neighborhood=" \t Mission \n ")
+
+        out, _ = self.run_todo("--neighborhood", "mission")
+
+        self.assertEqual(
+            sorted(self.listed_names(out, ["Blue Bottle", "Tartine"])),
+            ["Blue Bottle", "Tartine"],
+        )
+
+    def test_a_padded_neighborhood_prints_on_the_same_line_as_its_place(self):
+        """A stored newline would wrap one wishlist place onto two lines, so
+        the neighborhood would leave the line naming the place.
+
+        Asserted as "on the same line", not "exactly one line mentions
+        Mission" -- the latter stays true when the line splits, which would
+        make it a test no bug can fail.
+        """
+        self.make_place("Tartine", neighborhood="\nMission\n")
+
+        out, _ = self.run_todo()
+
+        place_lines = [line for line in self.lines(out) if "Tartine" in line]
+        self.assertEqual(len(place_lines), 1)
+        self.assertIn("Mission", place_lines[0])
+
+
+class SurpriseWhitespaceFilterTests(SurpriseCommandTestCase):
+    """``surprise --neighborhood`` uses the same ``iexact`` comparison."""
+
+    def test_a_padded_neighborhood_is_still_reachable_by_its_plain_name(self):
+        self.make_place("Tartine", neighborhood="\tMission\n")
+
+        out, _ = self.run_surprise("--neighborhood", "Mission", seed=0)
+
+        self.assertIn("Tartine", out)
+
+    def test_a_whitespace_only_neighborhood_is_not_a_candidate_for_a_real_one(self):
+        """Equivalent mutant, as in ``todo``: pinned for the criterion."""
+        self.make_place("Nameless", neighborhood="\t")
+
+        with self.assertRaises(CommandError):
+            self.run_surprise("--neighborhood", "Mission", seed=0)
+
+    def test_a_padded_neighborhood_prints_on_the_same_line_as_its_place(self):
+        """As in ``todo``: the neighborhood has to stay on the line that names
+        the place, which a stored newline would break."""
+        self.make_place("Tartine", neighborhood="\nMission\n")
+
+        out, _ = self.run_surprise(seed=0)
+
+        place_lines = [line for line in out.splitlines() if "Tartine" in line]
+        self.assertEqual(len(place_lines), 1)
+        self.assertIn("Mission", place_lines[0])
+
+
+class FindWhitespaceTests(FindCommandTestCase):
+    """``find``'s ``--neighborhood`` is a substring match, so padding does not
+    hide a place from it -- but a stored newline would still break the one
+    line per result the command promises, and the filter has to agree with
+    what the other commands consider blank.
+
+    Two of the four below are equivalent mutants, marked as such: on SQLite
+    ``icontains`` finds ``Mission`` inside ``"\\tMission\\n"`` whether or not
+    the value was normalized, so no test of that filter can tell the two
+    apart. They pin the criterion; the rendering tests are the ones that fail
+    when the normalization is removed.
+    """
+
+    def test_a_padded_neighborhood_prints_as_one_result_line(self):
+        self.make_place("Tartine", neighborhood="\nMission\n")
+
+        out, _ = self.run_find("tartine")
+
+        self.assertEqual(len(self.result_lines(out)), 1)
+        self.assertIn("Mission", out)
+
+    def test_a_padded_neighborhood_is_matched_by_the_filter(self):
+        """Equivalent mutant: ``icontains`` matched it before #23 too."""
+        self.make_place("Tartine", neighborhood="\tMission\n")
+
+        out, _ = self.run_find("tartine", "--neighborhood", "Mission")
+
+        self.assertIn("Tartine", out)
+
+    def test_a_whitespace_only_neighborhood_is_treated_as_no_neighborhood(self):
+        """Filtering on a real neighborhood must not turn it up, and the
+        result line must not carry an invisible field. Equivalent mutant, as
+        for ``todo``: a tab was never a substring match for ``Mission``."""
+        self.make_place("Nameless", neighborhood="\t")
+        self.make_place("Blue Bottle", neighborhood="Mission")
+
+        out, _ = self.run_find("blue", "--neighborhood", "Mission")
+
+        self.assertIn("Blue Bottle", out)
+        self.assertNotIn("Nameless", out)
+
+    def test_a_blank_neighborhood_renders_like_an_absent_one(self):
+        blank = self.make_place("Nameless", neighborhood="\t\n")
+        absent = self.make_place("Anonymous", neighborhood="")
+
+        out, _ = self.run_find("names")
+
+        self.assertEqual(blank.neighborhood, absent.neighborhood)
+        self.assertEqual(len(self.result_lines(out)), len(self.lines(out)))
