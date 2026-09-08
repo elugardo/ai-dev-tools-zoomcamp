@@ -142,9 +142,23 @@ The chain runs out when two candidates are identical in every scored field.
 Those come back in an unspecified order relative to each other -- **no
 exception is raised, and nothing else is consulted to break the tie**. There
 is no data left to break it with, and reaching for input position would be
-position dependence under another name. Two candidates that far identical are
-interchangeable in the output anyway: whichever way they land, the printed
-lines are the same.
+position dependence under another name.
+
+The two rows are not necessarily interchangeable to the *caller* -- ``find``
+prints ``status`` and ``rating`` as well, and two places alike in all four
+scored fields can still differ in those, so their printed lines can differ
+and their order can flip with the input order. That is accepted rather than
+fixed: separating them would mean scoring or keying a field this module does
+not read, which is a wider contract than the candidate one above and a
+different change from this one. A caller that needs those two rows ordered
+has the data to order them and this module does not.
+
+One consequence of keys 2-5 being lowercased and stripped is worth naming,
+since it is the same trade seen from the other side: two candidates differing
+*only* in the case or the padding of a scored field also produce equal keys,
+so they too fall back on input order. They are the same place typed twice,
+and having the ranker prefer one spelling of it would be a worse answer than
+declining to.
 
 Each candidate handed in produces exactly one result; this module neither
 deduplicates the input nor invents entries.

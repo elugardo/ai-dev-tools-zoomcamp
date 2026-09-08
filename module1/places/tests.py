@@ -2346,6 +2346,18 @@ class SearchDuplicateNameOrderTests(unittest.TestCase):
         scores = {result.score for result in search.rank_places(query, candidates)}
         self.assertEqual(len(scores), 1, "candidates must tie on score")
 
+    def assertOnePlaceOrderFor(self, query, candidates):
+        """As :meth:`assertOneOrderFor`, but comparing the candidates
+        themselves -- for data whose name, neighborhood and note are identical
+        and whose tags are the only thing left to tell apart."""
+        orders = [
+            [result.place for result in search.rank_places(query, list(order))]
+            for order in itertools.permutations(candidates)
+        ]
+        for order in orders[1:]:
+            self.assertEqual(order, orders[0])
+        return orders[0]
+
     def test_two_places_sharing_a_name_rank_the_same_whichever_order_they_arrive(self):
         """The defect, stated directly: same name, same score, opposite inputs."""
         mitte = place("Blue Bottle", "pour over", "Mitte", ["coffee"])
@@ -2416,6 +2428,76 @@ class SearchDuplicateNameOrderTests(unittest.TestCase):
         self.assertEqual(
             rankings[0], [("armchairs",), ("outdoor",), ("wifi",)]
         )
+
+    def test_the_name_is_consulted_before_the_neighborhood(self):
+        """Chain order, link 2 before link 3. The two candidates disagree about
+        which of them comes first depending on which key is asked: by name it
+        is ``alpha``, by neighborhood it is ``zulu``. Only the documented order
+        gives the answer below, so swapping those two links fails here.
+
+        The query matches nothing, so both score 0 and the names -- which do
+        differ, and would otherwise move the scores apart -- cannot break the
+        tie by scoring instead of by ordering."""
+        by_name = place("alpha", "same note", "bravo", ["coffee"])
+        by_hood = place("zulu", "same note", "alpha", ["coffee"])
+
+        self.assertAllTied(self.MISS, [by_name, by_hood])
+        ranked = self.assertOneOrderFor(self.MISS, [by_name, by_hood])
+
+        self.assertEqual([name for name, _, _ in ranked], ["alpha", "zulu"])
+
+    def test_the_neighborhood_is_consulted_before_the_note(self):
+        """Chain order, link 3 before link 4, on QA's data: the neighborhoods
+        say ``alpha`` first and the notes say ``bravo`` first, so the two keys
+        answer this pair oppositely and only their documented order passes."""
+        by_hood = place("Blue Bottle", "zulu", "alpha", ["coffee"])
+        by_note = place("Blue Bottle", "alpha", "bravo", ["coffee"])
+
+        self.assertAllTied(self.QUERY, [by_hood, by_note])
+        ranked = self.assertOneOrderFor(self.QUERY, [by_hood, by_note])
+
+        self.assertEqual([hood for _, hood, _ in ranked], ["alpha", "bravo"])
+
+    def test_the_tags_are_consulted_last_of_all(self):
+        """Chain order, link 5 after links 3 and 4. Neighborhood and note both
+        put ``alpha`` first; the tags put the other one first. Moving the tag
+        key ahead of either therefore flips this answer."""
+        earlier = place("Blue Bottle", "alpha", "alpha", ["zulu"])
+        later = place("Blue Bottle", "bravo", "bravo", ["alpha"])
+
+        self.assertAllTied(self.QUERY, [earlier, later])
+        ranked = self.assertOneOrderFor(self.QUERY, [earlier, later])
+
+        self.assertEqual([hood for _, hood, _ in ranked], ["alpha", "bravo"])
+
+    def test_the_tag_key_lowercases_the_names_it_reads(self):
+        """``_tag_names`` hands back the stored spelling, so the key does the
+        lowercasing -- as the module docstring promises it does on read, never
+        assuming the caller normalized first. The data discriminates: a raw
+        ASCII sort puts ``WiFi`` ahead of ``armchairs`` because every capital
+        precedes every lowercase letter.
+
+        Nothing in the app reaches this today, since ``Tag.save`` lowercases on
+        write. The promise is to a caller handing in its own objects, and this
+        is what defends it."""
+        upper = place("Blue Bottle", "same note", "Mitte", ["WiFi"])
+        lower = place("Blue Bottle", "same note", "Mitte", ["armchairs"])
+
+        self.assertAllTied(self.QUERY, [upper, lower])
+        ranked = self.assertOnePlaceOrderFor(self.QUERY, [upper, lower])
+
+        self.assertEqual(ranked, [lower, upper])
+
+    def test_the_tag_key_strips_the_names_it_reads(self):
+        """Same promise, the whitespace half. A space precedes every letter, so
+        an unstripped ``"  zulu "`` would sort ahead of ``armchairs``."""
+        padded = place("Blue Bottle", "same note", "Mitte", ["  zulu "])
+        plain = place("Blue Bottle", "same note", "Mitte", ["armchairs"])
+
+        self.assertAllTied(self.QUERY, [padded, plain])
+        ranked = self.assertOnePlaceOrderFor(self.QUERY, [padded, plain])
+
+        self.assertEqual(ranked, [plain, padded])
 
     def test_the_tie_break_ignores_the_case_of_the_secondary_keys(self):
         """The chain lowercases past the name too: a raw ASCII sort puts every
