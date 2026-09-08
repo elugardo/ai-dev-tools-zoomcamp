@@ -4598,6 +4598,16 @@ class SurpriseFilterTests(SurpriseCommandTestCase):
 
                 self.assertIn("Sightglass", out)
 
+    def test_the_neighborhood_lookup_strips_surrounding_whitespace(self):
+        """``__iexact`` folds case but matches the value verbatim otherwise,
+        so the padding has to come off before the filter is built."""
+        padded, _ = self.run_surprise("--neighborhood", "  soma  ", seed=0)
+        bare, _ = self.run_surprise("--neighborhood", "SoMa", seed=0)
+
+        self.assertIn("Sightglass", padded)
+        self.assertNotIn("Blue Bottle", padded)
+        self.assertEqual(padded, bare)
+
     def test_the_neighborhood_matches_the_whole_value_not_a_substring(self):
         """Partial matching is deliberately ``find``'s job, not this one's."""
         with self.assertRaises(CommandError):
@@ -4656,6 +4666,23 @@ class SurpriseEmptyCaseTests(SurpriseCommandTestCase):
             call_command("surprise", stdout=out)
 
         self.assertEqual(out.getvalue(), "")
+
+    def test_an_empty_journal_says_so_even_when_filters_were_given(self):
+        """Which question is asked first is a decision, so it is pinned here.
+
+        ``todo`` and ``find`` both ask "is the journal empty?" *before* they
+        filter, and ``surprise`` matches them: on an empty database the news
+        is that there is nothing to filter, not that the filters were too
+        narrow. Checking the filters first would read as "your filters were
+        too narrow" to someone who has simply not added a place yet, and
+        nothing else in the suite would notice the flip.
+        """
+        message = self.message_of("--tag", "ramen")
+
+        self.assertEqual(Place.objects.count(), 0)
+        self.assertIn("no places in the journal", message)
+        self.assertNotIn("Nothing matches those filters", message)
+        self.assertNotIn("--tag ramen", message)
 
     def test_filters_that_match_nothing_read_differently_from_an_empty_journal(self):
         empty = self.message_of()
