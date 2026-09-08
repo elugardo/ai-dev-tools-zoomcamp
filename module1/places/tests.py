@@ -26,6 +26,208 @@ from django.utils import timezone as django_timezone
 from places import search
 from places.models import Place, Tag, normalize_tag_name
 
+# ---------------------------------------------------------------------------
+# Shared AST helpers, used by every source-rule test in this file (issue #21)
+# ---------------------------------------------------------------------------
+#
+# A source rule says something about the *code* of a module -- what it imports,
+# what it calls, what it orders by -- and every one of them below is asserted
+# over parsed nodes rather than over the module's text.
+#
+# `inspect.getsource()` returns docstrings and comments as well as code, so a
+# text assertion measures the documentation. Three tests here were proved
+# defeatable that way: `.order_by("pk")` deleted while the docstring still
+# quoted it, `todo.py` pasting a local copy of `describe_place` while its
+# docstring still credited `places.lookup`, and `add.py` hand-rolling
+# normalization with `.casefold()`. The mirror image was proved too -- one
+# purely documentary sentence added to `search.py` failed a passing test with
+# no code change.
+#
+# An assertion over the AST can be neither satisfied nor broken by prose:
+# comments never reach the tree at all, and the docstrings that do are excluded
+# where it matters (see `_string_constants`). Reach for these helpers rather
+# than for `getsource()` when adding a source rule.
+#
+# Know the limit of the technique, though: a parse tree says what the code
+# *says*, not what it *runs*. Nothing here distinguishes reachable code from
+# dead code, so a call sitting under `if False:` -- or in a branch no input can
+# reach -- satisfies a positive assertion just as a live one does. Where the
+# rule is about what actually happens at runtime rather than about which
+# mechanism the module reuses, a behavioral test is the one that proves it, and
+# these rules are a complement to those tests rather than a substitute.
+
+
+def _module_tree(module):
+    """``module``'s source, parsed. The basis of every helper below."""
+    return ast.parse(inspect.getsource(module))
+
+
+def _imported_modules(module):
+    """Every module name ``module`` imports, from its parsed source.
+
+    Imports rather than a grep over the text, because the text includes
+    docstrings: a module that *names* the ranker to explain why it must not
+    use it is exactly right, and a substring search would call that a
+    violation.
+    """
+    imported = set()
+    for node in ast.walk(_module_tree(module)):
+        if isinstance(node, ast.Import):
+            imported.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            imported.add(node.module or "")
+    return imported
+
+
+def _imported_names(module, package):
+    """The names ``module`` imports *from* ``package``.
+
+    ``_imported_names(todo, "places.lookup")`` is ``{"describe_place"}``, and
+    stays empty however warmly the docstring credits the shared module.
+    """
+    names = set()
+    for node in ast.walk(_module_tree(module)):
+        if isinstance(node, ast.ImportFrom) and (node.module or "") == package:
+            names.update(alias.asname or alias.name for alias in node.names)
+    return names
+
+
+def _defined_functions(module):
+    """Every function ``module`` defines itself, at any nesting depth.
+
+    The other half of "imports it rather than copying it": a pasted copy of a
+    shared helper shows up here under its own name.
+    """
+    return {
+        node.name
+        for node in ast.walk(_module_tree(module))
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+
+def _called_names(module):
+    """Every function name ``module`` calls -- ``foo()`` and ``bar.foo()``."""
+    called = set()
+    for node in ast.walk(_module_tree(module)):
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Name):
+                called.add(node.func.id)
+            elif isinstance(node.func, ast.Attribute):
+                called.add(node.func.attr)
+    return called
+
+
+def _dotted_calls(module):
+    """Every ``name.attribute()`` call in ``module``, as ``"name.attribute"``."""
+    calls = set()
+    for node in ast.walk(_module_tree(module)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+        ):
+            calls.add(f"{node.func.value.id}.{node.func.attr}")
+    return calls
+
+
+def _attribute_chains(module):
+    """Every ``name.attribute`` access in ``module``, called or not.
+
+    ``Place.Status.VISITED`` contributes ``"Place.Status"``, which is how a
+    test asks whether the choices class is referred to rather than retyped.
+    """
+    chains = set()
+    for node in ast.walk(_module_tree(module)):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+            chains.add(f"{node.value.id}.{node.attr}")
+    return chains
+
+
+def _referenced_names(module):
+    """Every identifier ``module`` mentions in code: bare names and attributes.
+
+    Broader than ``_called_names`` -- it sees a constant that is read but never
+    called, such as a threshold the module has no business knowing about.
+    """
+    names = set()
+    for node in ast.walk(_module_tree(module)):
+        if isinstance(node, ast.Name):
+            names.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            names.add(node.attr)
+    return names
+
+
+def _string_arguments(module, method):
+    """Every literal string ``module`` passes to a ``.method(...)`` call.
+
+    ``_string_arguments(module, "order_by")`` reports the fields the module
+    orders by; ``_string_arguments(module, "prefetch_related")`` what it
+    prefetches. Non-literal arguments -- ``Lower("name")`` -- are not strings
+    and do not appear.
+    """
+    arguments = set()
+    for node in ast.walk(_module_tree(module)):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == method
+        ):
+            arguments.update(
+                argument.value
+                for argument in node.args
+                if isinstance(argument, ast.Constant)
+                and isinstance(argument.value, str)
+            )
+    return arguments
+
+
+def _query_lookups(module):
+    """Every ORM lookup ``module`` spells out, as its trailing segment.
+
+    ``filter(name__iexact=typed)`` contributes ``"iexact"`` and
+    ``filter(tags__name=n)`` contributes ``"name"``, so a test can ask whether
+    a command reaches for case-insensitive matching of its own.
+    """
+    lookups = set()
+    for node in ast.walk(_module_tree(module)):
+        if isinstance(node, ast.Call):
+            for keyword in node.keywords:
+                if keyword.arg and "__" in keyword.arg:
+                    lookups.add(keyword.arg.rsplit("__", 1)[1])
+    return lookups
+
+
+def _string_constants(module):
+    """Every string literal in ``module``'s code, docstrings excluded.
+
+    Exact values, not substrings: this is what makes ``"visited"`` typed as a
+    status distinguishable from the word "visited" inside a sentence the
+    command prints. Comments never reach the tree at all.
+    """
+    tree = _module_tree(module)
+    docstrings = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            continue
+        first = node.body[0] if node.body else None
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            docstrings.add(id(first.value))
+
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in docstrings
+    }
+
 
 class ProjectSkeletonTests(unittest.TestCase):
     """Smoke tests proving the places app is wired into the project."""
@@ -961,27 +1163,30 @@ class AddCommandDiscoveryTests(SimpleTestCase):
 
 
 class AddCommandSourceRuleTests(SimpleTestCase):
-    """Two rules issue #4 states as a grep over ``add.py``.
+    """Two rules issue #4 states about ``add.py`` itself.
 
     These are deliberately source-level rather than behavioral: both describe a
     *mechanism* the command must reuse instead of reimplementing, and a
     reimplementation would pass every behavioral test right up until the day
-    the shared normalizer or the choices class changes.
+    the shared normalizer or the choices class changes. Read off the AST, never
+    off the text -- see the helper block at the top of this file.
     """
 
     def test_add_does_not_hand_roll_tag_normalization(self):
-        source = inspect.getsource(_add_module())
+        called = _called_names(_add_module())
 
-        self.assertNotIn("lower", source)
-        self.assertNotIn("iexact", source)
-        self.assertIn("normalize_tag_name", source)
+        for hand_rolled in ("lower", "casefold", "upper", "title"):
+            with self.subTest(call=hand_rolled):
+                self.assertNotIn(hand_rolled, called)
+        self.assertNotIn("iexact", _query_lookups(_add_module()))
+        self.assertIn("normalize_tag_name", called)
 
     def test_add_refers_to_the_status_choices_class_not_to_string_literals(self):
-        source = inspect.getsource(_add_module())
+        constants = _string_constants(_add_module())
 
-        self.assertNotIn('"%s"' % Place.Status.WISHLIST.value, source)
-        self.assertNotIn('"%s"' % Place.Status.VISITED.value, source)
-        self.assertIn("Place.Status", source)
+        self.assertNotIn(Place.Status.WISHLIST.value, constants)
+        self.assertNotIn(Place.Status.VISITED.value, constants)
+        self.assertIn("Place.Status", _attribute_chains(_add_module()))
 
 
 class AddCommandTestCase(TestCase):
@@ -1486,18 +1691,8 @@ class SearchModuleContractTests(unittest.TestCase):
     a queryset to it that happens to work in their environment.
     """
 
-    def source(self):
-        return inspect.getsource(search)
-
     def test_the_module_imports_neither_the_models_nor_django(self):
-        imported = set()
-        for node in ast.walk(ast.parse(self.source())):
-            if isinstance(node, ast.Import):
-                imported.update(alias.name for alias in node.names)
-            elif isinstance(node, ast.ImportFrom):
-                imported.add(node.module or "")
-
-        for module in imported:
+        for module in _imported_modules(search):
             self.assertFalse(
                 module == "places.models"
                 or module.startswith("django")
@@ -1506,23 +1701,19 @@ class SearchModuleContractTests(unittest.TestCase):
             )
 
     def test_the_module_performs_no_database_access_of_its_own(self):
-        source = self.source()
+        """Nodes, not text: the module docstring describes the caller's
+        queryset, and a sentence about a prefetch is not a prefetch."""
+        referenced = _referenced_names(search)
 
-        self.assertNotIn(".objects", source)
-        self.assertNotIn("select_related", source)
-        self.assertNotIn("prefetch_related", source)
-        self.assertNotIn("filter(", source)
+        self.assertNotIn("objects", referenced)
+        self.assertNotIn("select_related", referenced)
+        self.assertNotIn("prefetch_related", referenced)
+        self.assertNotIn("filter", _called_names(search))
 
     def test_the_module_neither_prints_nor_writes(self):
         """Calls, not text: the docstring shows the caller printing, which is
         the point -- the module returns a value and prints nothing itself."""
-        called = set()
-        for node in ast.walk(ast.parse(self.source())):
-            if isinstance(node, ast.Call):
-                if isinstance(node.func, ast.Name):
-                    called.add(node.func.id)
-                elif isinstance(node.func, ast.Attribute):
-                    called.add(node.func.attr)
+        called = _called_names(search)
 
         self.assertNotIn("print", called)
         self.assertNotIn("open", called)
@@ -1555,7 +1746,7 @@ class SearchModuleContractTests(unittest.TestCase):
         """Both numbers exist once, as their constant. A literal 60 or 3
         anywhere else in the module is the bug this criterion forbids."""
         named = {"STRONG_MATCH_THRESHOLD", "WEAK_MATCH_LIMIT"}
-        tree = ast.parse(self.source())
+        tree = _module_tree(search)
         declarations = {
             id(node.value)
             for node in ast.walk(tree)
@@ -2064,33 +2255,39 @@ class FindCommandDiscoveryTests(SimpleTestCase):
 
 
 class FindCommandSourceRuleTests(SimpleTestCase):
-    """Rules issue #6 states as a grep over ``find.py``.
+    """Rules issue #6 states about ``find.py`` itself.
 
     Deliberately source-level: each describes a mechanism the command must
     *delegate* rather than reimplement, and a reimplementation would pass every
-    behavioral test right up until the ranker or the normalizer changes.
+    behavioral test right up until the ranker or the normalizer changes. Read
+    off the AST -- ``find.py``'s docstring discusses the threshold and the
+    fallback at length, and saying so is not doing so.
     """
 
     def test_find_delegates_ranking_and_owns_no_scoring_of_its_own(self):
-        source = inspect.getsource(_find_module())
+        referenced = _referenced_names(_find_module())
 
-        self.assertIn("rank_places", source)
-        self.assertNotIn("rapidfuzz", source)
-        self.assertNotIn("fuzz", source)
-        self.assertNotIn("STRONG_MATCH_THRESHOLD", source)
+        self.assertIn("rank_places", _called_names(_find_module()))
+        for module in _imported_modules(_find_module()):
+            with self.subTest(module=module):
+                self.assertFalse(module.startswith("rapidfuzz"))
+        self.assertEqual([name for name in referenced if "fuzz" in name], [])
+        self.assertNotIn("STRONG_MATCH_THRESHOLD", referenced)
 
     def test_find_does_not_re_sort_what_the_ranker_returned(self):
-        source = inspect.getsource(_find_module())
+        called = _called_names(_find_module())
 
-        self.assertNotIn("sorted(", source)
-        self.assertNotIn(".sort(", source)
+        self.assertNotIn("sorted", called)
+        self.assertNotIn("sort", called)
 
     def test_find_does_not_hand_roll_tag_normalization(self):
-        source = inspect.getsource(_find_module())
+        called = _called_names(_find_module())
 
-        self.assertIn("normalize_tag_name", source)
-        self.assertNotIn("lower()", source)
-        self.assertNotIn("iexact", source)
+        self.assertIn("normalize_tag_name", called)
+        for hand_rolled in ("lower", "casefold", "upper", "title"):
+            with self.subTest(call=hand_rolled):
+                self.assertNotIn(hand_rolled, called)
+        self.assertNotIn("iexact", _query_lookups(_find_module()))
 
 
 class FindCommandTestCase(TestCase):
@@ -2695,48 +2892,6 @@ def _todo_module():
     return todo_module
 
 
-def _imported_modules(module):
-    """Every module name ``module`` imports, from its source.
-
-    Imports rather than a grep over the text, because the text includes
-    docstrings: a module that *names* the ranker to explain why it must not
-    use it is exactly right, and a substring search would call that a
-    violation.
-    """
-    imported = set()
-    for node in ast.walk(ast.parse(inspect.getsource(module))):
-        if isinstance(node, ast.Import):
-            imported.update(alias.name for alias in node.names)
-        elif isinstance(node, ast.ImportFrom):
-            imported.add(node.module or "")
-    return imported
-
-
-def _called_names(module):
-    """Every function name ``module`` calls -- ``foo()`` and ``bar.foo()``."""
-    called = set()
-    for node in ast.walk(ast.parse(inspect.getsource(module))):
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Name):
-                called.add(node.func.id)
-            elif isinstance(node.func, ast.Attribute):
-                called.add(node.func.attr)
-    return called
-
-
-def _dotted_calls(module):
-    """Every ``name.attribute()`` call in ``module``, as ``"name.attribute"``."""
-    calls = set()
-    for node in ast.walk(ast.parse(inspect.getsource(module))):
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and isinstance(node.func.value, ast.Name)
-        ):
-            calls.add(f"{node.func.value.id}.{node.func.attr}")
-    return calls
-
-
 class LookupModuleContractTests(SimpleTestCase):
     """What the shared module must be, before what it must do.
 
@@ -2770,20 +2925,38 @@ class LookupModuleContractTests(SimpleTestCase):
         self.assertNotIn("rank_places", _called_names(_lookup_module()))
 
     def test_both_commands_import_the_shared_module_rather_than_copying_it(self):
-        for module in (_visit_module(), _todo_module()):
-            with self.subTest(module=module.__name__):
-                source = inspect.getsource(module)
+        """Imports, definitions *and* the call, not text.
 
-                self.assertIn("places.lookup", source)
+        Copying is exactly what this test exists to prevent, and a pasted copy
+        leaves the docstring's "comes from ``places.lookup``" in place -- which
+        is how a text assertion was defeated by the very mutation it guarded
+        against. So the name has to arrive through an ``import`` and the
+        command must not define one of its own.
+
+        The call is the third assertion because the first two are not enough:
+        an import that is retained but never used, next to a pasted copy under
+        a different name, satisfies both while the command renders from its own
+        code. An unused import is not a dependency -- it is a comment that
+        happens to parse.
+        """
+        for module, borrowed in (
+            (_visit_module(), "resolve_place"),
+            (_todo_module(), "describe_place"),
+        ):
+            with self.subTest(module=module.__name__):
+                self.assertIn("places.lookup", _imported_modules(module))
+                self.assertIn(borrowed, _imported_names(module, "places.lookup"))
+                self.assertNotIn(borrowed, _defined_functions(module))
+                self.assertIn(borrowed, _called_names(module))
 
     def test_neither_command_reimplements_name_matching(self):
         """``visit`` resolves through the helper; the lookups themselves must
         not be spelled out a second time in the command."""
-        source = inspect.getsource(_visit_module())
+        lookups = _query_lookups(_visit_module())
 
-        self.assertIn("resolve_place", source)
-        self.assertNotIn("name__iexact", source)
-        self.assertNotIn("name__icontains", source)
+        self.assertIn("resolve_place", _called_names(_visit_module()))
+        self.assertNotIn("iexact", lookups)
+        self.assertNotIn("icontains", lookups)
 
 
 class ResolvePlaceTests(TestCase):
@@ -3116,10 +3289,12 @@ class VisitCommandSourceRuleTests(SimpleTestCase):
         self.assertNotIn("getpass", _imported_modules(_visit_module()))
 
     def test_visit_refers_to_the_status_choices_class_not_to_string_literals(self):
-        source = inspect.getsource(_visit_module())
-
-        self.assertNotIn('"%s"' % Place.Status.VISITED.value, source)
-        self.assertIn("Place.Status", source)
+        """Exact literals, so the word "visited" inside a printed sentence --
+        which ``visit`` says a great deal -- is not mistaken for a status."""
+        self.assertNotIn(
+            Place.Status.VISITED.value, _string_constants(_visit_module())
+        )
+        self.assertIn("Place.Status", _attribute_chains(_visit_module()))
 
 
 class VisitCommandTestCase(TestCase):
@@ -3675,25 +3850,27 @@ class TodoCommandDiscoveryTests(SimpleTestCase):
 
 
 class TodoCommandSourceRuleTests(SimpleTestCase):
-    """Rules issue #7 states as a grep over ``todo.py``."""
+    """Rules issue #7 states about ``todo.py`` itself, read off the AST."""
 
     def test_todo_does_not_hand_roll_tag_normalization(self):
-        source = inspect.getsource(_todo_module())
+        called = _called_names(_todo_module())
 
-        self.assertIn("normalize_tag_name", source)
-        self.assertNotIn(".lower()", source)
+        self.assertIn("normalize_tag_name", called)
+        for hand_rolled in ("lower", "casefold", "upper", "title"):
+            with self.subTest(call=hand_rolled):
+                self.assertNotIn(hand_rolled, called)
 
     def test_todo_orders_in_the_database_rather_than_in_python(self):
-        source = inspect.getsource(_todo_module())
+        called = _called_names(_todo_module())
 
-        self.assertIn("order_by", source)
-        self.assertNotIn("sorted(", source)
-        self.assertNotIn(".sort(", source)
+        self.assertIn("order_by", called)
+        self.assertNotIn("sorted", called)
+        self.assertNotIn("sort", called)
 
     def test_todo_prefetches_the_tags_it_prints(self):
-        source = inspect.getsource(_todo_module())
-
-        self.assertIn('prefetch_related("tags")', source)
+        self.assertIn(
+            "tags", _string_arguments(_todo_module(), "prefetch_related")
+        )
 
 
 class TodoCommandTestCase(TestCase):
@@ -4196,10 +4373,12 @@ class SurpriseCommandSourceRuleTests(SimpleTestCase):
     """Rules issue #8 states which are cheaper to read off the source."""
 
     def test_surprise_does_not_hand_roll_tag_normalization(self):
-        source = inspect.getsource(_surprise_module())
+        called = _called_names(_surprise_module())
 
-        self.assertIn("normalize_tag_name", source)
-        self.assertNotIn(".lower()", source)
+        self.assertIn("normalize_tag_name", called)
+        for hand_rolled in ("lower", "casefold", "upper", "title"):
+            with self.subTest(call=hand_rolled):
+                self.assertNotIn(hand_rolled, called)
 
     def test_surprise_draws_from_a_private_generator_not_the_global_one(self):
         calls = _dotted_calls(_surprise_module())
@@ -4210,10 +4389,18 @@ class SurpriseCommandSourceRuleTests(SimpleTestCase):
         self.assertNotIn("random.choice", calls)
 
     def test_surprise_orders_its_candidates_by_primary_key(self):
-        self.assertIn('order_by("pk")', inspect.getsource(_surprise_module()))
+        """The field passed to ``.order_by(...)``, not the text.
+
+        ``_candidates``' docstring quotes ``order_by("pk")`` while explaining
+        why the order matters, and that sentence kept this test green after the
+        call itself was deleted. The AST holds the argument, not the prose.
+        """
+        self.assertIn("pk", _string_arguments(_surprise_module(), "order_by"))
 
     def test_surprise_prefetches_the_tags_it_prints(self):
-        self.assertIn('prefetch_related("tags")', inspect.getsource(_surprise_module()))
+        self.assertIn(
+            "tags", _string_arguments(_surprise_module(), "prefetch_related")
+        )
 
     def test_surprise_reads_the_clock_through_django(self):
         calls = _dotted_calls(_surprise_module())
