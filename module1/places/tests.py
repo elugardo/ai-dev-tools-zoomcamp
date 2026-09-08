@@ -2385,6 +2385,23 @@ class FindCommandSourceRuleTests(SimpleTestCase):
         self.assertNotIn("sorted", called)
         self.assertNotIn("sort", called)
 
+    def test_find_does_not_hand_roll_the_rankers_tokenizer(self):
+        """The rule this issue exists because of (#18).
+
+        The bug was two layers disagreeing about what counts as searchable
+        text, and the way that happens is a command deciding it for itself.
+        So the guard asks ``has_searchable_tokens`` -- the ranker's own
+        tokenizer -- and ``find.py`` owns no token pattern of its own.
+
+        Source-level because it has to be: a local ``re.compile(r"[0-9a-zA-Z]+")``
+        here is behaviorally equivalent to the delegation *today*, so no
+        behavioral test can tell them apart. It stops being equivalent the
+        moment ``_TOKEN_PATTERN`` moves, which is exactly when a second copy
+        would resurrect the bug.
+        """
+        self.assertIn("has_searchable_tokens", _called_names(_find_module()))
+        self.assertNotIn("re", _imported_modules(_find_module()))
+
     def test_find_does_not_hand_roll_tag_normalization(self):
         called = _called_names(_find_module())
 
