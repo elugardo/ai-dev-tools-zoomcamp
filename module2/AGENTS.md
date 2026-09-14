@@ -5,6 +5,9 @@ module 2. Admins manage restaurants, restaurant staff run their live waitlist,
 and eaters join a list and watch their place in line. The course spec is
 [`_docs/WaitWise_Restaurant_Waitlist_Manager_Specification.md`](_docs/WaitWise_Restaurant_Waitlist_Manager_Specification.md).
 The API contract is [`openapi.yaml`](openapi.yaml).
+[`_docs/progress.md`](_docs/progress.md) records what has shipped, the
+decisions behind it, and the open items. Read it before starting work, and add a
+dated entry at the end of each session.
 
 **Where the project stands:** Phases 2 and 3 of the spec (§3) are done.
 
@@ -26,6 +29,14 @@ npm run dev:mock       # frontend on the in-browser mock, no backend needed
 npm run test:all       # frontend (vitest) then backend (pytest)
 npm run build          # frontend typecheck + production build
 ```
+
+The `Makefile` in `module2/` wraps the same commands: `make install`, `make dev`
+(both servers in one terminal), `make backend`, `make frontend`, `make mock`,
+`make test` and `make build`. Keep it in step with `package.json`. Its recipes
+use only `npm --prefix` and `uv --directory`, so they run the same under `sh` and
+Windows `cmd`. Keep `help` text free of `( ) < > | & ;` and quotes, because the
+two shells parse those differently. On this machine GNU Make comes from winget
+(`ezwinports.make`); open a new shell after installing so it is on `PATH`.
 
 Backend, from `module2/backend/`:
 

@@ -250,6 +250,11 @@ npm run dev            # terminal 2: app on http://localhost:3417
 To run the UI with no backend at all, use `npm run dev:mock` instead of the two
 commands above.
 
+If you have GNU make, `module2/Makefile` wraps the same commands. `make install`
+installs dependencies, and `make dev` starts the backend and frontend together
+in one terminal; Ctrl+C stops both. `make mock` runs the frontend on the mock,
+`make test` runs every test, and `make` on its own lists all targets.
+
 Demo accounts come from the seed data. All of them use the password `password`:
 
 | Username | Role | Lands on |
@@ -278,7 +283,7 @@ seed and signs everyone out.
 
 ```
 module2/
-├── _docs/          the WaitWise specification
+├── _docs/          the WaitWise specification, and progress.md: what shipped, decisions, open items
 ├── openapi.yaml    the API contract both halves are tested against
 ├── frontend/
 │   └── src/
