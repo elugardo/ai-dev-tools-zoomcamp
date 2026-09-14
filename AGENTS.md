@@ -3,7 +3,8 @@
 Repo for the AI Dev Tools Zoomcamp. Each module is its own self-contained
 project in a numbered folder, and nothing is shared between them.
 
-- **module2 — WaitWise**, a restaurant waitlist web app (React + TypeScript).
+- **module2 — WaitWise**, a restaurant waitlist web app (React + TypeScript
+  frontend, FastAPI backend).
   Current work. It has its own [`module2/AGENTS.md`](module2/AGENTS.md); when
   working under `module2/`, follow that file and ignore the rest of this one.
 - **module1 — City Journal**, a personal place-journal CLI built on Django 6.1 +

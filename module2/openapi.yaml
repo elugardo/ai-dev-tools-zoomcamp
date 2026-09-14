@@ -26,20 +26,29 @@ info:
 
     ## Authentication
 
-    Deliberately simplified for the class project (spec §5).
+    This goes beyond the class spec (§5 ignores passwords): logins check real,
+    hashed passwords.
 
-    - `POST /auth/login` takes a username and a password. **The password is
-      ignored**: any value, including an empty string, is accepted for a known
-      username. Usernames are matched after trimming and lowercasing.
-    - The response carries an opaque `token`. The frontend stores it in
-      `localStorage` and sends it on staff and admin calls as
-      `Authorization: Bearer <token>`.
-    - There is no JWT, refresh, expiry or logout endpoint. An unknown or stale
-      token gets `401`, and the frontend then sends the user back to the login
-      page.
+    - `POST /auth/login` takes a username and a password. Usernames are matched
+      after trimming and lowercasing. The password must match. A wrong password
+      and an unknown username get the same `401` message, so the response
+      doesn't reveal which usernames exist.
+    - Passwords are stored only as salted hashes. They are never returned by any
+      endpoint.
+    - The response carries an opaque `token`, a random string rather than a
+      JWT. The frontend stores it in `localStorage` and sends it on staff and
+      admin calls as `Authorization: Bearer <token>`.
+    - A token **expires 12 hours** after login. Changing a restaurant's password
+      revokes that restaurant's existing tokens. Tokens are held in memory, so a
+      backend restart also signs everyone out. An expired, revoked or unknown
+      token gets `401`, and the frontend sends the user back to the login page.
+      There is no refresh or logout endpoint; logging out just drops the token
+      in the browser.
     - Public and eater endpoints need no token. Restaurant endpoints need a
       `RESTAURANT` user and always act on **that user's own restaurant**. Admin
       endpoints need the `ADMIN` user. The wrong role gets `403`.
+    - The demo seed's accounts (`admin`, `bluebird`, `oakember`) all use the
+      password `password`.
 
     ## Errors
 
@@ -51,7 +60,7 @@ info:
 
     | HTTP | `code`            | When |
     |------|-------------------|------|
-    | 401  | `UNAUTHORIZED`    | Missing or unknown token; unknown username at login |
+    | 401  | `UNAUTHORIZED`    | Missing, expired or unknown token; wrong username or password at login |
     | 403  | `FORBIDDEN`       | Valid token, wrong role |
     | 404  | `NOT_FOUND`       | Restaurant, token or entry does not exist (or belongs to another restaurant) |
     | 409  | `WAITLIST_CLOSED` | Online join while the restaurant is inactive or paused |
@@ -116,8 +125,9 @@ paths:
       x-service-method: login
       summary: Log in as the admin or a restaurant
       description: |
-        Looks up the user by username (trimmed, case-insensitive). The password
-        is accepted but not checked. The frontend then sends the user to
+        Looks up the user by username (trimmed, case-insensitive) and checks
+        the password against its stored hash. On success it issues a new
+        bearer token, valid for 12 hours. The frontend then sends the user to
         `/admin` for `ADMIN` or `/restaurant/dashboard` for `RESTAURANT`.
       security: []
       requestBody:
@@ -125,7 +135,7 @@ paths:
         content:
           application/json:
             schema: { $ref: '#/components/schemas/LoginRequest' }
-            example: { username: bluebird, password: anything }
+            example: { username: bluebird, password: password }
       responses:
         '200':
           description: Logged in.
@@ -133,10 +143,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/LoginResult' }
               example:
-                token: 3f6c1d2e-9a41-4b7e-8c55-0d2f7a9b1e64
+                token: q3Zk8pV1Jx0tQ9mB2rW7cL5nY4sH6dF8aE1uG3iK0oM
                 user: { id: 2, username: bluebird, role: RESTAURANT, restaurant_id: 1 }
         '401':
-          $ref: '#/components/responses/UnknownUsername'
+          $ref: '#/components/responses/LoginFailed'
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -453,6 +463,9 @@ paths:
         not part of the request. The form's defaults are a 30-minute wait, a
         10-minute no-show timeout and active (spec §22). The frontend returns
         to `/admin` on success.
+
+        **A password of at least 8 characters is required.** It is hashed
+        before storage.
       security:
         - bearerAuth: []
       x-required-role: ADMIN
@@ -470,7 +483,7 @@ paths:
               no_show_minutes: 10
               is_active: true
               username: harbor
-              password: anything
+              password: noodles-123
       responses:
         '201':
           description: Created.
@@ -517,10 +530,12 @@ paths:
       summary: Edit a restaurant and its login
       description: |
         Full replacement of the editable fields. The whole form is sent every
-        time. **An empty `password` keeps the current password.** Changing
-        `username` renames the restaurant's login, and the old username stops
-        working. `online_waitlist_enabled` is not part of this request and is
-        left unchanged.
+        time. **An empty `password` keeps the current password.** A non-empty
+        one must be at least 8 characters, replaces the old password, and signs
+        out every existing session for that restaurant. Changing `username`
+        renames the restaurant's login, and the old username stops working.
+        `online_waitlist_enabled` is not part of this request and is left
+        unchanged.
       security:
         - bearerAuth: []
       x-required-role: ADMIN
@@ -587,9 +602,10 @@ components:
       type: http
       scheme: bearer
       description: |
-        The opaque `token` returned by `POST /auth/login`. It identifies a user;
-        it is not a JWT. Each operation's `x-required-role` names the role it
-        needs.
+        The opaque `token` returned by `POST /auth/login`: a random string, not
+        a JWT, that the server maps to a user. It expires 12 hours after login
+        and is revoked when that user's password changes. Each operation's
+        `x-required-role` names the role it needs.
 
   parameters:
     RestaurantId:
@@ -606,17 +622,21 @@ components:
 
   responses:
     Unauthorized:
-      description: Missing, unknown or stale token.
+      description: Missing, expired, revoked or unknown token.
+      headers:
+        WWW-Authenticate:
+          description: Always `Bearer`.
+          schema: { type: string }
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
           example: { code: UNAUTHORIZED, message: Your session has expired. Please log in again., field_errors: {} }
-    UnknownUsername:
-      description: No user has that username.
+    LoginFailed:
+      description: Unknown username or wrong password. The message is the same for both.
       content:
         application/json:
           schema: { $ref: '#/components/schemas/Error' }
-          example: { code: UNAUTHORIZED, message: "We don't recognize that username.", field_errors: {} }
+          example: { code: UNAUTHORIZED, message: Incorrect username or password., field_errors: {} }
     Forbidden:
       description: Signed in, but with the wrong role for this endpoint.
       content:
@@ -709,7 +729,8 @@ components:
           description: Matched after trimming and lowercasing.
         password:
           type: string
-          description: Required by the form, but its contents are ignored. May be empty.
+          minLength: 1
+          description: Checked against the user's stored hash. Sent exactly as typed, with no trimming.
 
     SessionUser:
       type: object
@@ -798,17 +819,14 @@ components:
       type: object
       description: |
         Body of both create (`POST`) and edit (`PUT`). The server trims every
-        string, and lowercases `username` before validating it.
+        string except `password`, and lowercases `username` before validating
+        it. The frontend always sends every field. The server fills in the
+        listed defaults for any that are omitted.
       required:
         - name
         - address
         - phone
-        - description
-        - current_wait_minutes
-        - no_show_minutes
-        - is_active
         - username
-        - password
       properties:
         name:
           type: string
@@ -822,6 +840,7 @@ components:
         description:
           type: string
           maxLength: 500
+          default: ''
           description: May be empty.
         current_wait_minutes:
           type: integer
@@ -845,10 +864,12 @@ components:
             `^[a-z0-9_-]+$` and be unique across all users (else `409 CONFLICT`).
         password:
           type: string
+          default: ''
           description: |
-            Stored as given, with no hashing (spec §5), and never checked at
-            login. May be empty. On `PUT`, an empty string keeps the existing
-            password.
+            The restaurant login's password, stored only as a salted hash and
+            never returned. On `POST` it is required and must be at least 8
+            characters. On `PUT`, an empty string keeps the existing password;
+            anything else must be at least 8 characters.
 
     RestaurantSettingsRequest:
       type: object

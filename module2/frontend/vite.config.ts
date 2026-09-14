@@ -11,5 +11,8 @@ export default defineConfig({
     restoreMocks: true,
     // Full-app renders with jsdom are slow on some machines when files run in parallel.
     testTimeout: 20_000,
+    // Each worker holds its own jsdom; one per core starves memory-constrained machines
+    // and workers then time out on startup.
+    maxWorkers: 4,
   },
 })

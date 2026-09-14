@@ -6,7 +6,7 @@ import { beforeEach, describe, expect, it } from 'vitest'
 import type { JoinWaitlistInput, RestaurantInput } from '../../domain/types'
 import { ServiceError } from '../errors'
 import type { WaitWiseService } from '../WaitWiseService'
-import { emptyDb, seedDb } from './mockDb'
+import { DEMO_PASSWORD, emptyDb, seedDb } from './mockDb'
 import { createMockService, MOCK_DB_STORAGE_KEY } from './mockService'
 
 const party = (overrides: Partial<JoinWaitlistInput> = {}): JoinWaitlistInput => ({
@@ -26,7 +26,7 @@ const newRestaurant = (overrides: Partial<RestaurantInput> = {}): RestaurantInpu
   no_show_minutes: 10,
   is_active: true,
   username: 'harbor',
-  password: 'secret',
+  password: 'noodles-123',
   ...overrides,
 })
 
@@ -47,7 +47,7 @@ function setup(initialDb = seedDb) {
     },
     now: () => clock,
     signIn: async (username: string) => {
-      token = (await service.login(username, 'whatever')).token
+      token = (await service.login(username, DEMO_PASSWORD)).token
     },
   }
 }
@@ -64,15 +64,18 @@ async function bluebirdId(service: WaitWiseService) {
 }
 
 describe('authentication', () => {
-  it('accepts any password for a known username, case-insensitively', async () => {
+  it('logs in with the right password, matching the username case-insensitively', async () => {
     const { service } = setup()
-    const result = await service.login('  BlueBird ', '')
+    const result = await service.login('  BlueBird ', DEMO_PASSWORD)
     expect(result.user).toMatchObject({ username: 'bluebird', role: 'RESTAURANT' })
-    expect((await service.login('admin', 'x')).user.role).toBe('ADMIN')
+    expect((await service.login('admin', DEMO_PASSWORD)).user.role).toBe('ADMIN')
   })
 
-  it('rejects an unknown username', async () => {
-    await expectServiceError(setup().service.login('nobody', 'x'), 'UNAUTHORIZED')
+  it('rejects a wrong password and an unknown username with the same message', async () => {
+    const wrong = await expectServiceError(setup().service.login('bluebird', 'not-it'), 'UNAUTHORIZED')
+    const unknown = await expectServiceError(setup().service.login('nobody', DEMO_PASSWORD), 'UNAUTHORIZED')
+    expect(wrong.message).toBe('Incorrect username or password.')
+    expect(unknown.message).toBe(wrong.message)
   })
 
   it('refuses staff and admin calls without the right role', async () => {
@@ -328,7 +331,7 @@ describe('admin', () => {
     const created = await ctx.service.createRestaurant(newRestaurant({ username: 'Harbor' }))
     expect(created).toMatchObject({ name: 'Harbor Noodle', username: 'harbor', online_waitlist_enabled: true })
     expect((await ctx.service.getRestaurants()).map((r) => r.name)).toContain('Harbor Noodle')
-    expect((await ctx.service.login('harbor', 'anything')).user.restaurant_id).toBe(created.id)
+    expect((await ctx.service.login('harbor', 'noodles-123')).user.restaurant_id).toBe(created.id)
   })
 
   it('edits a restaurant and its login username', async () => {
@@ -339,8 +342,9 @@ describe('admin', () => {
       current_wait_minutes: 5,
     })
     expect(updated).toMatchObject({ name: 'Bluebird Bistro', current_wait_minutes: 5, username: 'bistro' })
-    expect((await ctx.service.login('bistro', 'x')).user.restaurant_id).toBe(before.id)
-    await expectServiceError(ctx.service.login('bluebird', 'x'), 'UNAUTHORIZED')
+    // A blank password on edit kept the old one.
+    expect((await ctx.service.login('bistro', DEMO_PASSWORD)).user.restaurant_id).toBe(before.id)
+    await expectServiceError(ctx.service.login('bluebird', DEMO_PASSWORD), 'UNAUTHORIZED')
   })
 
   it('rejects a username that another restaurant already uses', async () => {
@@ -366,7 +370,7 @@ describe('persistence', () => {
 
     const id = await bluebirdId(eaterTab)
     const view = await eaterTab.joinWaitlist(id, party())
-    staffToken = (await staffTab.login('bluebird', '')).token
+    staffToken = (await staffTab.login('bluebird', DEMO_PASSWORD)).token
     const mine = (await staffTab.getRestaurantWaitlist()).active.find((e) => e.public_token === view.public_token)!
     await staffTab.updateWaitlistEntry(mine.id, 'NOTIFIED')
 

@@ -3,7 +3,6 @@ import { Navigate, useNavigate } from 'react-router-dom'
 import { homePathFor, useAuth } from '../auth/AuthContext'
 import { ErrorNotice } from '../components/Feedback'
 import { Field } from '../components/Field'
-import { serviceMode } from '../services'
 
 export function LoginPage() {
   const { user, login } = useAuth()
@@ -11,6 +10,7 @@ export function LoginPage() {
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [usernameError, setUsernameError] = useState<string>()
+  const [passwordError, setPasswordError] = useState<string>()
   const [error, setError] = useState<unknown>(null)
   const [submitting, setSubmitting] = useState(false)
 
@@ -19,11 +19,11 @@ export function LoginPage() {
   async function handleSubmit(event: FormEvent) {
     event.preventDefault()
     setError(null)
-    if (!username.trim()) {
-      setUsernameError('Username is required.')
-      return
-    }
-    setUsernameError(undefined)
+    const missingUsername = username.trim() ? undefined : 'Username is required.'
+    const missingPassword = password ? undefined : 'Password is required.'
+    setUsernameError(missingUsername)
+    setPasswordError(missingPassword)
+    if (missingUsername || missingPassword) return
     setSubmitting(true)
     try {
       const signedIn = await login(username, password)
@@ -46,7 +46,7 @@ export function LoginPage() {
               <input {...props} autoComplete="username" value={username} onChange={(e) => setUsername(e.target.value)} />
             )}
           </Field>
-          <Field label="Password" hint="Any password works in this class version.">
+          <Field label="Password" error={passwordError}>
             {(props) => (
               <input
                 {...props}
@@ -62,7 +62,9 @@ export function LoginPage() {
           </button>
         </form>
       </section>
-      {serviceMode === 'mock' ? <p className="fine-print">Demo logins: admin, bluebird, oakember.</p> : null}
+      {import.meta.env.DEV ? (
+        <p className="fine-print">Demo logins: admin, bluebird, oakember. Password: password</p>
+      ) : null}
     </div>
   )
 }
