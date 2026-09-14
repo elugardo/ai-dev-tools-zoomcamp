@@ -1,9 +1,14 @@
 # AGENTS.md
 
 Repo for the AI Dev Tools Zoomcamp. Each module is its own self-contained
-project in a numbered folder. Current work is **module1 — City Journal**, a
-personal place-journal CLI built on Django 6.1 + SQLite. Run every command below
-from `module1/`, which is where the virtualenv and `manage.py` live.
+project in a numbered folder, and nothing is shared between them.
+
+- **module2 — WaitWise**, a restaurant waitlist web app (React + TypeScript).
+  Current work. It has its own [`module2/AGENTS.md`](module2/AGENTS.md); when
+  working under `module2/`, follow that file and ignore the rest of this one.
+- **module1 — City Journal**, a personal place-journal CLI built on Django 6.1 +
+  SQLite. Everything below this list applies to module1 only. Run every command
+  below from `module1/`, which is where the virtualenv and `manage.py` live.
 
 ## Commands
 

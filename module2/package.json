@@ -1,0 +1,12 @@
+{
+  "name": "waitwise",
+  "private": true,
+  "description": "WaitWise restaurant waitlist manager (AI Dev Tools Zoomcamp, module 2)",
+  "scripts": {
+    "setup": "npm --prefix frontend install",
+    "dev": "npm --prefix frontend run dev",
+    "build": "npm --prefix frontend run build",
+    "test:frontend": "npm --prefix frontend test",
+    "test:all": "npm run test:frontend"
+  }
+}
