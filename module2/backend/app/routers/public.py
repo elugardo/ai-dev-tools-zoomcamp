@@ -1,5 +1,7 @@
 """Public endpoints: browsing restaurants and the eater's own waitlist entry.
-No token needed; an entry is addressed by its unguessable public token."""
+No token needed; an entry is addressed by its unguessable public token.
+
+Each request runs in one database transaction (see auth.SessionDep)."""
 
 from fastapi import APIRouter, status
 
@@ -17,8 +19,7 @@ router = APIRouter()
     operation_id="getRestaurants",
 )
 def get_restaurants(store: StoreDep) -> list[PublicRestaurant]:
-    with store.transaction():
-        return [public_restaurant(store, r) for r in store.list_restaurants(active_only=True)]
+    return [public_restaurant(store, r) for r in store.list_restaurants(active_only=True)]
 
 
 @router.get(
@@ -28,8 +29,7 @@ def get_restaurants(store: StoreDep) -> list[PublicRestaurant]:
     operation_id="getRestaurant",
 )
 def get_restaurant(restaurant_id: int, store: StoreDep) -> PublicRestaurant:
-    with store.transaction():
-        return public_restaurant(store, store.restaurant(restaurant_id))
+    return public_restaurant(store, store.restaurant(restaurant_id))
 
 
 @router.post(
@@ -40,9 +40,7 @@ def get_restaurant(restaurant_id: int, store: StoreDep) -> PublicRestaurant:
     operation_id="joinWaitlist",
 )
 def join_waitlist(restaurant_id: int, body: JoinWaitlistRequest, store: StoreDep) -> EaterWaitlistView:
-    with store.transaction():
-        entry = store.add_entry(restaurant_id, body, WaitlistSource.ONLINE)
-        return eater_view(store, entry)
+    return eater_view(store, store.add_entry(restaurant_id, body, WaitlistSource.ONLINE))
 
 
 @router.get(
@@ -52,8 +50,7 @@ def join_waitlist(restaurant_id: int, body: JoinWaitlistRequest, store: StoreDep
     operation_id="getWaitlistEntry",
 )
 def get_waitlist_entry(token: str, store: StoreDep) -> EaterWaitlistView:
-    with store.transaction():
-        return eater_view(store, store.entry_by_token(token))
+    return eater_view(store, store.entry_by_token(token))
 
 
 @router.delete(
@@ -63,6 +60,5 @@ def get_waitlist_entry(token: str, store: StoreDep) -> EaterWaitlistView:
     operation_id="cancelWaitlistEntry",
 )
 def cancel_waitlist_entry(token: str, store: StoreDep) -> EaterWaitlistView:
-    with store.transaction():
-        entry = store.change_status(store.entry_by_token(token), WaitlistStatus.CANCELED)
-        return eater_view(store, entry)
+    entry = store.change_status(store.entry_by_token(token), WaitlistStatus.CANCELED)
+    return eater_view(store, entry)

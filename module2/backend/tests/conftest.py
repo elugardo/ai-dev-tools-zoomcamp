@@ -1,21 +1,33 @@
-"""Shared fixtures: a hand-cranked clock, a fresh store per test, and API clients.
+"""Shared fixtures: a hand-cranked clock, a fresh database per test, and API clients.
 
-Every test gets its own app and store, so no state leaks between tests. Hashing
-uses a low scrypt cost to keep the suite fast; production uses Settings' default.
+Tests run against a real database through SQLAlchemy. By default that is an
+in-memory SQLite database, created and thrown away per test. Point
+WAITWISE_TEST_DATABASE_URL at another database (for example a disposable
+Postgres) to run the same suite there; its tables are dropped and recreated for
+every test, so never aim it at data you want to keep.
+
+Hashing uses a low scrypt cost to keep the suite fast; production uses Settings' default.
 """
 
+import os
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy import delete
 
 from app.config import Settings
+from app.db import create_db_engine, drop_schema, is_sqlite_memory
 from app.main import create_app
 from app.store import Store
+from app.tables import WaitlistEntry
 
 START = datetime(2026, 9, 14, 18, 0, tzinfo=UTC)
 FAST_SCRYPT_N = 2**10
 DEMO_PASSWORD = "password"
+TEST_DATABASE_URL = os.environ.get("WAITWISE_TEST_DATABASE_URL", "sqlite://")
 
 
 class Clock:
@@ -30,12 +42,18 @@ class Clock:
 
 
 class Api:
-    """A TestClient plus login helpers, so tests read as API calls."""
+    """A TestClient plus login and database helpers, so tests read as API calls."""
 
-    def __init__(self, client: TestClient, store: Store, clock: Clock):
+    def __init__(self, client: TestClient, clock: Clock):
         self.client = client
-        self.store = store
         self.clock = clock
+        self.app = client.app
+
+    @contextmanager
+    def db(self) -> Iterator[Store]:
+        """A Store in its own committed transaction, for arranging or inspecting data directly."""
+        with self.app.state.session_factory.begin() as session:
+            yield Store(session, clock=self.clock, local_tz=UTC)
 
     def login(self, username: str, password: str = DEMO_PASSWORD) -> dict[str, str]:
         response = self.client.post("/api/auth/login", json={"username": username, "password": password})
@@ -64,12 +82,25 @@ class Api:
         return self.request("delete", path, **kwargs)
 
 
-def make_api(clock: Clock, *, seed: bool = True, without_entries: bool = False) -> Api:
-    store = Store(clock=clock, local_tz=UTC)
-    app = create_app(Settings(seed_demo_data=seed, scrypt_n=FAST_SCRYPT_N), store)
+def build_api(clock: Clock, *, database_url: str = TEST_DATABASE_URL, seed: bool = True, without_entries: bool = False) -> Api:
+    engine = create_db_engine(database_url)
+    if not is_sqlite_memory(database_url):
+        drop_schema(engine)  # a shared database starts every test clean
+    settings = Settings(database_url=database_url, seed_demo_data=seed, scrypt_n=FAST_SCRYPT_N)
+    app = create_app(settings, engine=engine, clock=clock, local_tz=UTC)
     if without_entries:
-        store.entries.clear()
-    return Api(TestClient(app), store, clock)
+        with app.state.session_factory.begin() as session:
+            session.execute(delete(WaitlistEntry))
+    return Api(TestClient(app), clock)
+
+
+@contextmanager
+def api_for(clock: Clock, **options) -> Iterator[Api]:
+    api = build_api(clock, **options)
+    try:
+        yield api
+    finally:
+        api.app.state.engine.dispose()
 
 
 @pytest.fixture
@@ -78,21 +109,24 @@ def clock() -> Clock:
 
 
 @pytest.fixture
-def api(clock: Clock) -> Api:
+def api(clock: Clock) -> Iterator[Api]:
     """The demo seed: admin, Bluebird Cafe (id 1) and Oak & Ember (id 2) with parties."""
-    return make_api(clock)
+    with api_for(clock) as api:
+        yield api
 
 
 @pytest.fixture
-def quiet_api(clock: Clock) -> Api:
+def quiet_api(clock: Clock) -> Iterator[Api]:
     """The demo restaurants and logins with no waitlist entries."""
-    return make_api(clock, without_entries=True)
+    with api_for(clock, without_entries=True) as api:
+        yield api
 
 
 @pytest.fixture
-def empty_api(clock: Clock) -> Api:
+def empty_api(clock: Clock) -> Iterator[Api]:
     """No users, restaurants or entries at all."""
-    return make_api(clock, seed=False)
+    with api_for(clock, seed=False) as api:
+        yield api
 
 
 def party(**overrides) -> dict:

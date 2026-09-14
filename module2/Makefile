@@ -12,7 +12,7 @@ BACKEND_PORT := 9127
 .DEFAULT_GOAL := help
 MAKEFLAGS += --no-print-directory
 
-.PHONY: help install dev run backend frontend mock test test-frontend test-backend build
+.PHONY: help install dev run backend frontend mock test test-frontend test-backend build db-init db-reset
 
 help:
 	@echo WaitWise make targets, run from module2/
@@ -25,6 +25,9 @@ help:
 	@echo   make test-frontend   Run the Vitest suite
 	@echo   make test-backend    Run the pytest suite
 	@echo   make build           Typecheck and build the frontend
+	@echo   make db-init         Create any missing database tables
+	@echo   make db-reset        Drop and recreate the database, then load the demo data
+	@echo Database: WAITWISE_DATABASE_URL, default backend/waitwise.db - SQLite
 	@echo Demo logins: admin, bluebird, oakember - password: password
 
 install:
@@ -56,3 +59,10 @@ test-backend:
 
 build:
 	npm --prefix $(FRONTEND) run build
+
+# Both use WAITWISE_DATABASE_URL, like the server. db-reset deletes all data.
+db-init:
+	uv --directory $(BACKEND) run python -m app.manage init-db
+
+db-reset:
+	uv --directory $(BACKEND) run python -m app.manage reset-db

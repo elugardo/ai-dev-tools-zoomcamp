@@ -11,11 +11,119 @@ what is still open. Newest session first.
 |---|---|---|
 | 1. Scope | Covered by the spec itself; no separate scope doc | `_docs/` |
 | 2. Frontend on mock data | Done, 2026-09-14 | PR #32 |
-| 3. Backend | Done, with an in-memory store, 2026-09-14 | PR #33 |
-| 4. Database (SQLAlchemy) | **Not started** | — |
+| 3. Backend | Done, 2026-09-14 | PR #33 |
+| 4. Database (SQLAlchemy, SQLite by default) | Done, 2026-09-14 | branch `module2-sqlalchemy-db` |
 
-Test suite on 2026-09-14: 160 frontend (Vitest) and 161 backend (pytest), all
+Test suite on 2026-09-14: 163 frontend (Vitest) and 194 backend (pytest), all
 passing through `make test` or `npm run test:all`.
+
+---
+
+## 2026-09-14: SQLAlchemy database replaces the in-memory store
+
+### What shipped
+
+- **Persistence.** The backend now uses SQLAlchemy 2.0. SQLite is the default,
+  and `WAITWISE_DATABASE_URL` selects the database. The default is
+  `sqlite:///<backend>/waitwise.db`, which is gitignored.
+- **New modules:**
+  - `app/db.py`: the engine, one session and transaction per request, and the
+    `UTCDateTime` column type.
+  - `app/tables.py`: ORM tables for users, restaurants, waitlist entries and
+    auth tokens.
+  - `app/manage.py`: the `init-db`, `seed` and `reset-db` commands, also
+    available as `make db-init` and `make db-reset`.
+- **Store.** `app/store.py` is rewritten over a session with the same method
+  names. Routers lost their manual transaction blocks and otherwise changed
+  little. The API contract did not change.
+- **Durability.** Data and login sessions survive restarts. Tokens are stored
+  as SHA-256 hashes. The demo data loads only into an empty database.
+- **Length limits.** Values are now capped to match the database columns: guest
+  name 100, restaurant name 120, address 200, phone 32, username 64, password
+  128 characters. They are enforced in backend validation, frontend validation
+  and `openapi.yaml`.
+
+### Verification done
+
+- **Contract unchanged.** All 161 existing backend tests passed unchanged on
+  SQLite. The contract test still validates every operation against
+  `openapi.yaml`.
+- **New database tests.** `tests/test_database.py` adds 33 tests:
+  - reads the database URL from the environment;
+  - data and sessions survive a restart on a file database;
+  - seeds once; `reset-db` rebuilds;
+  - datetimes are UTC-aware and naive ones are refused;
+  - stores tokens hashed and purges expired ones;
+  - enforces foreign keys, check constraints and one login per restaurant;
+  - overlong values get a 422;
+  - a failed request rolls back completely;
+  - the unique constraint backstops the username check with a 409;
+  - stale concurrent status changes can't overwrite newer ones;
+  - portability guards: generic column types, no dialect code outside `db.py`,
+    and the schema compiles for PostgreSQL, MySQL and SQL Server.
+- **Deliberate breaks.** Key database guarantees were broken on purpose to
+  confirm tests fail, covering commit, rollback, UTC handling, token hashing,
+  conditional updates, seeding, foreign keys and native enums.
+- **Make targets.** `make db-reset` and `make db-init` were run; the default
+  database file is created in `backend/` and ignored by git.
+- **Real browser, on the database-backed server.** Starting from `make db-reset`,
+  with `make backend` and `make frontend`, the full spec §40 scenario passed in
+  headless Chrome: Notify reached the eater page in 5.0 s. Then only the
+  backend was restarted:
+  - the staff browser was still logged in, without a new login;
+  - the seated, walk-in and canceled parties were still in Today's History;
+  - the eater's status link still showed Seated;
+  - the admin-created restaurant was still listed, and the seed was not
+    duplicated.
+
+### Decisions and why
+
+- **Database-agnostic by construction.**
+  - Every dialect-specific setting lives in `db.py`: SQLite foreign-key pragma,
+    WAL, busy timeout, and `StaticPool` for in-memory databases.
+  - The rest uses ORM queries and generic types. Enums are stored as strings
+    with CHECK constraints instead of native enum types. Strings have explicit
+    lengths.
+  - Date arithmetic (no-show deadlines, today's history) stays in Python rather
+    than in database-specific SQL.
+- **Naive UTC storage behind `UTCDateTime`.** SQLite drops timezones and
+  Postgres keeps them. Storing naive UTC and returning aware UTC behaves the
+  same on both, and refusing naive input prevents local times from slipping in.
+- **One transaction per request** through a `yield` dependency with
+  `scope="function"`, so the commit happens before the response is sent. Any
+  exception, including a deliberate `ApiError`, rolls back everything the
+  request did.
+- **Conditional UPDATEs instead of row locks** for status changes and the
+  no-show sweep: `WHERE id = … AND status = expected`, checking the row count.
+  `SELECT … FOR UPDATE` is not supported the same way everywhere, and SQLite
+  ignores it. A stale request re-decides against the current status.
+- **Username uniqueness** is checked first so the response can name the field.
+  The database's unique constraint is the backstop for races and maps to a
+  generic 409.
+- **Expired tokens are purged at login**, not when an expired token is used.
+  That request ends in 401 and rolls back, so a delete there would never
+  commit. A test caught this.
+- **`create_all` at startup, no Alembic yet.** The schema is new and the data is
+  demo data. `make db-reset` rebuilds it after a schema change. Alembic would
+  add a dependency and migration files before there is anything to migrate.
+- **`app` is built lazily** through a module `__getattr__`. `uvicorn
+  app.main:app` still works, and importing `create_app` in tests never creates
+  or seeds `backend/waitwise.db`.
+- **Tests run on in-memory SQLite by default.** Setting
+  `WAITWISE_TEST_DATABASE_URL` runs the same suite on another database, dropping
+  its tables before every test.
+
+### Open items
+
+- **Postgres not yet exercised.** It needs a driver (`uv add psycopg[binary]`)
+  and a run of the suite against a disposable database via
+  `WAITWISE_TEST_DATABASE_URL`. Only schema compilation for PostgreSQL is
+  tested so far.
+- **No migrations.** Any schema change currently means `make db-reset`, which
+  loses data. Add Alembic before the first change that must keep data.
+- **The demo seed goes stale.** Its timestamps are fixed when it is loaded. On a
+  long-lived database the seeded parties look hours or days old; run
+  `make db-reset` for a fresh demo.
 
 ---
 
@@ -124,15 +232,14 @@ passing through `make test` or `npm run test:all`.
 
 ### Open items and loose ends
 
-- **Phase 4:** SQLAlchemy models (spec §25) replace `backend/app/store.py`.
-  SQLite is the default, with the database URL taken from the environment.
-  Routers, the contract and the tests should not need to change.
+- ~~**Phase 4:** SQLAlchemy models (spec §25) replace `backend/app/store.py`.~~
+  Done; see the database entry above.
 - **Homework:** the SHA1 is filled in at submission (`git rev-parse HEAD` on the
   submitted branch). The course homework and FAQ URLs are still to be added to
   the README.
 - **No server-side logout.** Logging out only drops the token in the browser;
-  the token stays valid until it expires or the password changes. Tokens also
-  live in memory, so every backend restart signs everyone out.
+  the token stays valid until it expires or the password changes. Tokens now
+  persist in the database, so this matters more than it did.
 - **"Today's History"** uses the server's local timezone in the backend and the
   browser's in the mock. That is fine locally, but a deployed backend needs one
   fixed timezone.

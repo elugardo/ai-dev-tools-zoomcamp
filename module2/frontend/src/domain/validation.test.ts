@@ -84,4 +84,25 @@ describe('restaurant validation', () => {
   it('rejects a username with spaces', () => {
     expect(validateRestaurantInput({ ...valid, username: 'blue bird' }, { isNew: true }).username).toBeDefined()
   })
+
+  it('enforces the database column lengths at the boundary', () => {
+    const at = { ...valid, name: 'n'.repeat(120), address: 'a'.repeat(200), username: 'u'.repeat(64), password: 'p'.repeat(128) }
+    expect(validateRestaurantInput(at, { isNew: true })).toEqual({})
+
+    const over = { ...valid, name: 'n'.repeat(121), address: 'a'.repeat(201), username: 'u'.repeat(65), password: 'p'.repeat(129) }
+    expect(Object.keys(validateRestaurantInput(over, { isNew: true })).sort()).toEqual(['address', 'name', 'password', 'username'])
+  })
+})
+
+describe('length limits on the join form', () => {
+  it('allows a 100-character name and rejects 101', () => {
+    expect(validateJoinInput({ ...validJoin, guest_name: 'x'.repeat(100) })).toEqual({})
+    expect(validateJoinInput({ ...validJoin, guest_name: 'x'.repeat(101) }).guest_name).toBe(
+      'Name must be 100 characters or fewer.',
+    )
+  })
+
+  it('rejects a phone number longer than 32 characters even with a valid digit count', () => {
+    expect(isValidPhone('5  5  5  5  5  5  5  5  5  5  5  5')).toBe(false)
+  })
 })

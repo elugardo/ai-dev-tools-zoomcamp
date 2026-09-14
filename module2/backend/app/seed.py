@@ -1,7 +1,9 @@
-"""Demo data (spec §34), loaded at startup so the frontend has something to show.
+"""Demo data (spec §34), so the frontend has something to show.
 
-Timestamps are relative to "now", so the queue looks live whenever the server
-starts. Every demo login uses the password `password`. Seeded eater pages have
+It is loaded only into an empty database (`seed_if_empty`), so restarting the
+server never duplicates or overwrites real data. Timestamps are relative to the
+moment of seeding, so a fresh database looks live; `python -m app.manage
+reset-db` rebuilds it when the demo queue has gone stale. Every demo login uses the password `password`. Seeded eater pages have
 readable tokens, for example /wait/demo-sarah.
 """
 
@@ -11,7 +13,8 @@ from datetime import timedelta
 
 from . import rules
 from .models import UserRole, WaitlistSource, WaitlistStatus
-from .store import EntryRecord, RestaurantRecord, Store
+from .store import Store
+from .tables import Restaurant, WaitlistEntry
 
 DEMO_PASSWORD = "password"
 
@@ -46,14 +49,21 @@ OAK_ENTRIES = [
 ]
 
 
+def seed_if_empty(store: Store, hash_password: Callable[[str], str]) -> bool:
+    """Seeds the demo data unless the database already has users. Returns True if it seeded."""
+    if store.has_users():
+        return False
+    seed_demo_data(store, hash_password)
+    return True
+
+
 def seed_demo_data(store: Store, hash_password: Callable[[str], str]) -> None:
     now = store.now()
     month_ago = now - timedelta(days=30)
     store.add_user("admin", hash_password(DEMO_PASSWORD), UserRole.ADMIN, None)
 
     def add_restaurant(username: str, entries: list[SeedEntry], **fields) -> None:
-        restaurant = RestaurantRecord(
-            id=max(store.restaurants, default=0) + 1,
+        restaurant = Restaurant(
             is_active=True,
             online_waitlist_enabled=True,
             no_show_minutes=10,
@@ -61,14 +71,14 @@ def seed_demo_data(store: Store, hash_password: Callable[[str], str]) -> None:
             updated_at=now - timedelta(hours=1),
             **fields,
         )
-        store.restaurants[restaurant.id] = restaurant
+        store.session.add(restaurant)
+        store.session.flush()
         store.add_user(username, hash_password(DEMO_PASSWORD), UserRole.RESTAURANT, restaurant.id)
 
         for seed in entries:
             joined_at = now - timedelta(minutes=seed.joined_minutes_ago)
             status_at = None if seed.status_after is None else joined_at + timedelta(minutes=seed.status_after)
-            entry = EntryRecord(
-                id=0,
+            entry = WaitlistEntry(
                 restaurant_id=restaurant.id,
                 public_token=seed.token,
                 guest_name=seed.guest,
@@ -88,7 +98,8 @@ def seed_demo_data(store: Store, hash_password: Callable[[str], str]) -> None:
                 # Seated and no-show parties were notified a few minutes first.
                 if seed.status in (WaitlistStatus.SEATED, WaitlistStatus.NO_SHOW):
                     entry.notified_at = status_at - timedelta(minutes=4)
-            store.insert_entry(entry)
+            store.session.add(entry)
+        store.session.flush()
 
     add_restaurant(
         "bluebird",

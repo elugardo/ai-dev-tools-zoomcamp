@@ -3,9 +3,9 @@
 - Passwords are hashed with scrypt from the standard library: a random salt per
   password, parameters stored with the hash, constant-time comparison.
 - A login issues an opaque random bearer token that the store maps to its user.
-  Tokens expire after `Settings.token_ttl_minutes`, and a restaurant's tokens
-  are revoked when its password changes. Tokens live in memory, so restarting
-  the server signs everyone out.
+  Only a SHA-256 of each token is stored. Tokens expire after
+  `Settings.token_ttl_minutes`, and a restaurant's tokens are revoked when its
+  password changes. They persist in the database, so sessions survive restarts.
 """
 
 import base64
@@ -21,7 +21,11 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
 from .errors import ForbiddenError, UnauthorizedError
 from .models import UserRole
-from .store import RestaurantRecord, Store, UserRecord
+from sqlalchemy.orm import Session
+
+from .db import get_session
+from .store import Store
+from .tables import Restaurant, User
 
 SCRYPT_R = 8
 SCRYPT_P = 1
@@ -71,7 +75,7 @@ def _dummy_hash(n: int) -> str:
     return hash_password("timing-equalizer", n=n)
 
 
-def authenticate(store: Store, username: str, password: str, *, scrypt_n: int) -> UserRecord:
+def authenticate(store: Store, username: str, password: str, *, scrypt_n: int) -> User:
     user = store.user_by_username(username)
     if user is None:
         # Verify against a throwaway hash so an unknown username takes as long as a wrong password.
@@ -82,7 +86,7 @@ def authenticate(store: Store, username: str, password: str, *, scrypt_n: int) -
     return user
 
 
-def issue_token(store: Store, user: UserRecord, ttl_minutes: int) -> str:
+def issue_token(store: Store, user: User, ttl_minutes: int) -> str:
     token = secrets.token_urlsafe(32)
     store.save_token(token, user.id, store.now() + timedelta(minutes=ttl_minutes))
     return token
@@ -93,9 +97,16 @@ def issue_token(store: Store, user: UserRecord, ttl_minutes: int) -> str:
 # auto_error=False so a missing header gets our Error body instead of FastAPI's.
 _bearer = HTTPBearer(auto_error=False, description="The token returned by POST /api/auth/login.")
 
+# scope="function": the session commits after the endpoint returns and before the
+# response is sent. Every dependency below shares this one per-request session.
+SessionDep = Annotated[Session, Depends(get_session, scope="function")]
 
-def get_store(request: Request) -> Store:
-    return request.app.state.store
+
+def get_store(request: Request, session: SessionDep) -> Store:
+    """A store over this request's session, with overdue no-shows swept first (spec §14)."""
+    store = Store(session, clock=request.app.state.clock, local_tz=request.app.state.local_tz)
+    store.sweep_no_shows()
+    return store
 
 
 StoreDep = Annotated[Store, Depends(get_store)]
@@ -104,7 +115,7 @@ StoreDep = Annotated[Store, Depends(get_store)]
 def current_user(
     store: StoreDep,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(_bearer)],
-) -> UserRecord:
+) -> User:
     if credentials is None or credentials.scheme.lower() != "bearer" or not credentials.credentials:
         raise UnauthorizedError("Please log in to continue.")
     user = store.user_for_token(credentials.credentials)
@@ -113,22 +124,21 @@ def current_user(
     return user
 
 
-def require_admin(user: Annotated[UserRecord, Depends(current_user)]) -> UserRecord:
+def require_admin(user: Annotated[User, Depends(current_user)]) -> User:
     if user.role is not UserRole.ADMIN:
         raise ForbiddenError("You don't have access to that page.")
     return user
 
 
-def require_restaurant(
-    store: StoreDep, user: Annotated[UserRecord, Depends(current_user)]
-) -> RestaurantRecord:
+def require_restaurant(store: StoreDep, user: Annotated[User, Depends(current_user)]) -> Restaurant:
     """The signed-in staff member's own restaurant. Staff can never address another one."""
     if user.role is not UserRole.RESTAURANT or user.restaurant_id is None:
         raise ForbiddenError("You don't have access to that page.")
-    if user.restaurant_id not in store.restaurants:
+    restaurant = store.session.get(Restaurant, user.restaurant_id)
+    if restaurant is None:
         raise UnauthorizedError(SESSION_EXPIRED)
-    return store.restaurants[user.restaurant_id]
+    return restaurant
 
 
-AdminUser = Annotated[UserRecord, Depends(require_admin)]
-StaffRestaurant = Annotated[RestaurantRecord, Depends(require_restaurant)]
+AdminUser = Annotated[User, Depends(require_admin)]
+StaffRestaurant = Annotated[Restaurant, Depends(require_restaurant)]

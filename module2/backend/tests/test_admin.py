@@ -49,7 +49,8 @@ class TestCreate:
 
     def test_stores_only_a_hash_of_the_password(self, api, admin):
         api.post("/admin/restaurants", json=restaurant_body(), headers=admin)
-        stored = api.store.user_by_username("harbor").password_hash
+        with api.db() as store:
+            stored = store.user_by_username("harbor").password_hash
         assert stored.startswith("scrypt$")
         assert "noodles-123" not in stored
 

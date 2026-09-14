@@ -39,8 +39,8 @@ info:
       JWT. The frontend stores it in `localStorage` and sends it on staff and
       admin calls as `Authorization: Bearer <token>`.
     - A token **expires 12 hours** after login. Changing a restaurant's password
-      revokes that restaurant's existing tokens. Tokens are held in memory, so a
-      backend restart also signs everyone out. An expired, revoked or unknown
+      revokes that restaurant's existing tokens. Only a SHA-256 of each token
+      is stored, and sessions survive a backend restart. An expired, revoked or unknown
       token gets `401`, and the frontend sends the user back to the login page.
       There is no refresh or logout endpoint; logging out just drops the token
       in the browser.
@@ -95,6 +95,10 @@ info:
       waitlist data, at least `GET /waitlist/{token}` and
       `GET /restaurant/waitlist`. The mock sweeps on every request, which also
       keeps `waiting_parties` counts accurate.
+    - **Persistence.** Everything, including login tokens, is stored in the
+      database named by `WAITWISE_DATABASE_URL`, so data and sessions survive
+      server restarts. String limits (`maxLength`) match the column sizes and
+      are validated before anything reaches the database.
     - **Polling.** The eater status page and the staff dashboard each poll
       their GET endpoint every 10 seconds. Keep those two endpoints cheap.
 
@@ -709,6 +713,7 @@ components:
 
     PhoneNumber:
       type: string
+      maxLength: 32
       pattern: '^\s*\+?[\d\s().-]+\s*$'
       description: |
         Basic format check only. An optional leading `+`, then digits with
@@ -730,6 +735,7 @@ components:
         password:
           type: string
           minLength: 1
+          maxLength: 128
           description: Checked against the user's stored hash. Sent exactly as typed, with no trimming.
 
     SessionUser:
@@ -831,10 +837,12 @@ components:
         name:
           type: string
           minLength: 1
+          maxLength: 120
           description: Required; must not be blank after trimming.
         address:
           type: string
           minLength: 1
+          maxLength: 200
           description: Required; must not be blank after trimming.
         phone: { $ref: '#/components/schemas/PhoneNumber' }
         description:
@@ -858,12 +866,14 @@ components:
         username:
           type: string
           minLength: 1
+          maxLength: 64
           pattern: '^\s*[A-Za-z0-9_-]+\s*$'
           description: |
             Stored trimmed and lowercased; after that it must match
             `^[a-z0-9_-]+$` and be unique across all users (else `409 CONFLICT`).
         password:
           type: string
+          maxLength: 128
           default: ''
           description: |
             The restaurant login's password, stored only as a salted hash and
@@ -901,6 +911,7 @@ components:
         guest_name:
           type: string
           minLength: 1
+          maxLength: 100
           description: Required; must not be blank after trimming.
         mobile_phone: { $ref: '#/components/schemas/PhoneNumber' }
         party_size:
