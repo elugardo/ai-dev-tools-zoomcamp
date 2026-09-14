@@ -31,7 +31,9 @@ The `Makefile` in `module2/` wraps the same commands: `make install`, `make dev`
 (both servers in one terminal), `make backend`, `make frontend`, `make mock`,
 `make test` and `make build`. Keep it in step with `package.json`. Its recipes
 use only `npm --prefix` and `uv --directory`, so they run the same under `sh` and
-Windows `cmd`. `make` is not installed on this machine.
+Windows `cmd`. Keep `help` text free of `( ) < > | & ;` and quotes, because the
+two shells parse those differently. On this machine GNU Make comes from winget
+(`ezwinports.make`); open a new shell after installing so it is on `PATH`.
 
 Backend, from `module2/backend/`:
 
