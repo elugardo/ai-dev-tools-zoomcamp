@@ -6,7 +6,7 @@ in its own numbered folder.
 | Module | Project | Stack |
 |---|---|---|
 | [Module 1](#module-1--city-journal) | City Journal: a personal place-journal CLI | Python, Django, SQLite |
-| [Module 2](#module-2--waitwise) | WaitWise: a restaurant waitlist manager | React, TypeScript, Vite (mock backend) |
+| [Module 2](#module-2--waitwise) | WaitWise: a restaurant waitlist manager | React, TypeScript, Vite, FastAPI |
 
 ## Module 1 — City Journal
 
@@ -199,45 +199,58 @@ It is deliberately not a reservation, table-management or POS system. The full
 spec is in
 [`module2/_docs/`](module2/_docs/WaitWise_Restaurant_Waitlist_Manager_Specification.md).
 
-### Status: frontend complete, running on a mock backend
+### Status: frontend and backend complete
 
 The course builds this in phases: scope, then frontend, then backend, then
-database. **Phase 2 (frontend) is done.** Every screen and workflow in the spec
-works in the browser today, with no server.
+database.
 
-That works because **every backend call goes through one services layer**:
+- **Phase 2, frontend:** done.
+- **Phase 3, backend:** done. A FastAPI server with an in-memory store, seeded
+  with demo data on startup.
+- **Phase 4, database:** SQLAlchemy, not started.
 
-- `WaitWiseService` is a TypeScript interface with one method per API endpoint.
-- The app currently runs on an in-browser **mock implementation** of that
-  interface. The mock enforces the real rules: validation, status transitions,
-  role checks, and automatic no-shows.
-- An architecture test fails the build if a page or component calls `fetch` or
-  imports the mock directly.
+The two halves meet at a single contract, [`module2/openapi.yaml`](module2/openapi.yaml):
 
-When the FastAPI backend arrives (Phase 3), an HTTP implementation replaces the
-mock and no screen changes.
+- **Frontend.** Every backend call goes through one services layer,
+  `WaitWiseService`, a TypeScript interface with one method per endpoint. It has
+  two implementations. The default HTTP client calls the FastAPI backend. An
+  in-browser mock enforces the same rules, so the UI still runs with no server
+  (`npm run dev:mock`).
+- **Backend.** Split into routers, models, store and auth modules, and serves
+  exactly the operations in `openapi.yaml`.
+- **Tests on both sides** check the code against the spec, so the two can't
+  drift apart.
 
-The mock keeps its data in `localStorage`. Open an eater page in one tab and the
-staff dashboard in another, and each sees the other's changes within 10 seconds.
+**Authentication goes beyond the course spec**, which ignores passwords.
+Restaurant and admin logins check scrypt-hashed passwords, and each login
+returns a bearer token. A token expires after 12 hours, and changing a
+restaurant's password revokes its tokens.
 
 ### Stack
 
-- **Frontend:** React 19, TypeScript, Vite, React Router, plain CSS
-- **Tests:** Vitest and React Testing Library
-- **Planned for Phases 3–4:** FastAPI, SQLAlchemy, Pydantic and pytest, on
-  SQLite locally and PostgreSQL in production
+- **Frontend:** React 19, TypeScript, Vite, React Router, plain CSS; Vitest and
+  React Testing Library
+- **Backend:** Python 3.13, FastAPI, Pydantic, uvicorn; pytest with FastAPI's
+  TestClient; managed with [uv](https://docs.astral.sh/uv/)
+- **Planned for Phase 4:** SQLAlchemy, with SQLite locally and PostgreSQL in
+  production
 
-Needs Node 20.19+ or 22.12+.
+Needs Node 20.19+ or 22.12+, Python 3.13, and uv.
 
 ### Usage
 
 ```
 cd ai-dev-tools-zoomcamp/module2
-npm run setup        # installs frontend dependencies
-npm run dev          # http://localhost:3417
+npm run setup          # frontend (npm) and backend (uv) dependencies
+
+npm run dev:backend    # terminal 1: API on http://localhost:9127 (docs at /docs)
+npm run dev            # terminal 2: app on http://localhost:3417
 ```
 
-Demo accounts come from the seed data, and any password works:
+To run the UI with no backend at all, use `npm run dev:mock` instead of the two
+commands above.
+
+Demo accounts come from the seed data. All of them use the password `password`:
 
 | Username | Role | Lands on |
 |---|---|---|
@@ -249,30 +262,44 @@ A quick demo of the core scenario:
 
 1. Open `http://localhost:3417`, pick **Bluebird Cafe**, and join as a party of 4.
    You land on your status page with your position and remaining wait.
-2. In a second tab, log in as `bluebird`. Your party is at the bottom of the
-   queue.
+2. In a second tab, log in as `bluebird` / `password`. Your party is at the
+   bottom of the queue.
 3. Click **Notify** on your party. Within 10 seconds the first tab shows
    **Your table is ready!** without a refresh.
 4. Click **Seat**. The party moves to **Today's History**.
 
 Seeded eater pages have readable links, such as
-`http://localhost:3417/wait/demo-sarah`. **Reset demo data** in the footer
-reseeds everything.
+`http://localhost:3417/wait/demo-sarah`.
+
+The backend keeps its data in memory. Restarting it resets everything to the
+seed and signs everyone out.
 
 ### Layout
 
 ```
 module2/
 ├── _docs/          the WaitWise specification
+├── openapi.yaml    the API contract both halves are tested against
 ├── frontend/
 │   └── src/
 │       ├── domain/     business rules: queue, wait time, validation (pure functions)
-│       ├── services/   WaitWiseService interface + mock implementation
+│       ├── services/   WaitWiseService interface + http client + in-browser mock
 │       ├── pages/      one component per route
 │       ├── components/ shared UI
 │       ├── auth/ hooks/ test/
 │       └── styles.css
-├── package.json    root scripts: setup, dev, build, test:all
+├── backend/
+│   ├── app/
+│   │   ├── main.py       app factory: CORS, error handlers, routers under /api
+│   │   ├── routers/      auth, public (restaurants + eater waitlist), restaurant, admin
+│   │   ├── models.py     Pydantic request/response models
+│   │   ├── store.py      in-memory store
+│   │   ├── auth.py       password hashing, bearer tokens, role checks
+│   │   ├── rules.py      pure waitlist rules
+│   │   └── seed.py, config.py, errors.py, serializers.py
+│   ├── tests/
+│   └── pyproject.toml, uv.lock
+├── package.json    scripts: setup, dev, dev:backend, dev:mock, build, test:all
 ├── AGENTS.md       commands and rules for coding agents
 └── CLAUDE.md       points to AGENTS.md
 ```
@@ -284,18 +311,27 @@ cd module2
 npm run test:all
 ```
 
-The suite has 116 tests:
+This runs 321 tests: 160 in the frontend (Vitest), then 161 in the backend
+(pytest).
 
-- **Domain rules:** wait-time math using the spec's worked example, queue order,
-  transitions, the no-show boundary, and form validation.
-- **Service contract:** the backend behaviors from spec §33, run against the mock
-  so they can be ported to pytest.
-- **Full-app UI:** every scenario in spec §32, including a fake-clock test that
-  the eater page picks up a Notify through polling.
-- **Architecture:** the services-layer boundary.
+- **Backend:**
+  - **Auth:** password hashing, login, token expiry and revocation, and role
+    checks on every protected endpoint.
+  - **Endpoints:** every endpoint, including the backend scenarios from spec §33.
+  - **No-show timing:** the automatic no-show boundary, driven by a controllable
+    clock.
+  - **Contract:** drives all 15 operations and validates each status code and
+    response body against `openapi.yaml`.
+- **Frontend:**
+  - **Domain rules:** the business rules as pure functions.
+  - **HTTP client:** every request and error mapping, checked against the
+    service interface's endpoint annotations.
+  - **Full-app UI:** the scenarios from spec §32, rendered against the mock.
+  - **Architecture:** an AST test that keeps network calls inside the services
+    layer.
 
-Each key rule was checked by deliberately breaking it and confirming a test
-failed.
+Each key rule on both sides was checked by deliberately breaking it and
+confirming a test failed.
 
 ### Homework Information
 
@@ -304,12 +340,15 @@ failed.
    `git rev-parse HEAD`.
 4. **Which command do you use to start the frontend?** `npm run dev`, run from
    `module2/frontend/` (or from `module2/`).
-5. **Which command do you use to start the backend?** Not built yet. Phase 3 will
-   use `uvicorn app.main:app --reload --port 9127`, run from `module2/backend/`.
+5. **Which command do you use to start the backend?**
+   `uv run uvicorn app.main:app --reload --port 9127`, run from
+   `module2/backend/`. Inside an activated virtualenv, plain
+   `uvicorn app.main:app --reload --port 9127` also works. From `module2/`,
+   `npm run dev:backend` does the same.
 6. **Which URL does the frontend use to talk to the backend?**
-   `http://localhost:9127/api`, set through `VITE_API_BASE_URL`. Until the
-   backend exists, the app uses the mock services layer.
+   `http://localhost:9127/api`, set through `VITE_API_BASE_URL`.
 7. **Which command do you use for running tests?** `npm run test:all`, run from
-   `module2/`. For now it runs the frontend suite; pytest joins it in Phase 3.
+   `module2/`. It runs the frontend Vitest suite and then the backend pytest
+   suite.
 
 The course homework and FAQ URLs will be added once they are published.

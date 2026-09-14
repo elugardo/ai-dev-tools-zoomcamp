@@ -2,6 +2,7 @@ import { render } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { App } from '../App'
 import { loadSession, saveSession } from '../auth/session'
+import { DEMO_PASSWORD } from '../services/mock/mockDb'
 import { createMockService, type MockServiceOptions } from '../services/mock/mockService'
 import type { WaitWiseService } from '../services/WaitWiseService'
 
@@ -16,7 +17,7 @@ export function createTestServices(options: Partial<MockServiceOptions> = {}): W
 
 /** Logs in through the service and stores the session, as the login page would. */
 export async function signInAs(services: WaitWiseService, username: string): Promise<void> {
-  saveSession(await services.login(username, 'anything'))
+  saveSession(await services.login(username, DEMO_PASSWORD))
 }
 
 /** Renders the full app — real routes, real pages — at `path`. */

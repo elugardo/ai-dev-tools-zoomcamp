@@ -3,10 +3,13 @@
   "private": true,
   "description": "WaitWise restaurant waitlist manager (AI Dev Tools Zoomcamp, module 2)",
   "scripts": {
-    "setup": "npm --prefix frontend install",
+    "setup": "npm --prefix frontend install && uv --directory backend sync",
     "dev": "npm --prefix frontend run dev",
+    "dev:mock": "npm --prefix frontend run dev:mock",
+    "dev:backend": "uv --directory backend run uvicorn app.main:app --reload --port 9127",
     "build": "npm --prefix frontend run build",
     "test:frontend": "npm --prefix frontend test",
-    "test:all": "npm run test:frontend"
+    "test:backend": "uv --directory backend run pytest",
+    "test:all": "npm run test:frontend && npm run test:backend"
   }
 }

@@ -8,6 +8,7 @@ import { estimateReadyAt } from '../../domain/waitlist'
 export interface UserRecord {
   id: number
   username: string
+  /** Plain text: this is an in-browser mock. The real backend stores only a salted hash. */
   password: string
   role: UserRole
   restaurant_id: number | null
@@ -55,6 +56,9 @@ export interface MockDb {
   entries: EntryRecord[]
 }
 
+/** Every demo login uses this password, matching the backend's seed. */
+export const DEMO_PASSWORD = 'password'
+
 export function emptyDb(): MockDb {
   return { users: [], restaurants: [], entries: [] }
 }
@@ -88,7 +92,7 @@ export function seedDb(now: Date): MockDb {
   db.users.push({
     id: 1,
     username: 'admin',
-    password: 'anything',
+    password: DEMO_PASSWORD,
     role: 'ADMIN',
     restaurant_id: null,
     created_at: at(60 * 24 * 30),
@@ -104,7 +108,7 @@ export function seedDb(now: Date): MockDb {
     db.users.push({
       id: nextId(db.users),
       username,
-      password: 'anything',
+      password: DEMO_PASSWORD,
       role: 'RESTAURANT',
       restaurant_id: id,
       created_at: at(60 * 24 * 30),

@@ -276,7 +276,7 @@ export function createMockService(options: MockServiceOptions): WaitWiseService 
     raw: RestaurantInput,
     existingLogin: UserRecord | null,
   ): RestaurantInput {
-    const errors = validateRestaurantInput(raw)
+    const errors = validateRestaurantInput(raw, { isNew: existingLogin === null })
     if (hasErrors(errors)) throw validationError(errors)
     const input = normalizeRestaurantInput(raw)
     const taken = db.users.some((u) => u.username === input.username && u.id !== existingLogin?.id)
@@ -291,12 +291,14 @@ export function createMockService(options: MockServiceOptions): WaitWiseService 
   // ---- the service -------------------------------------------------------
 
   return {
-    login: (username, _password) =>
+    login: (username, password) =>
       call((): LoginResult => {
-        // Password contents are ignored by design (spec §5).
         const db = loadDb()
         const user = db.users.find((u) => u.username === username.trim().toLowerCase())
-        if (!user) throw new ServiceError('UNAUTHORIZED', "We don't recognize that username.")
+        // Same message for both failures, so a login attempt can't discover usernames.
+        if (!user || user.password !== password) {
+          throw new ServiceError('UNAUTHORIZED', 'Incorrect username or password.')
+        }
         return {
           token: `${TOKEN_PREFIX}${user.id}`,
           user: { id: user.id, username: user.username, role: user.role, restaurant_id: user.restaurant_id },

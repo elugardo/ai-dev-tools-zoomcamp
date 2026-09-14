@@ -13,6 +13,7 @@ export const DESCRIPTION_MAX = 500
 export const WAIT_MINUTES_MAX = 240
 export const NO_SHOW_MINUTES_MIN = 1
 export const NO_SHOW_MINUTES_MAX = 120
+export const PASSWORD_MIN = 8
 
 export function hasErrors(errors: object): boolean {
   return Object.keys(errors).length > 0
@@ -76,7 +77,15 @@ export function normalizeRestaurantInput(input: RestaurantInput): RestaurantInpu
   }
 }
 
-export function validateRestaurantInput(raw: RestaurantInput): FieldErrors<RestaurantInput> {
+/**
+ * `isNew` is true when creating a restaurant, where a password is required. On
+ * edit a blank password keeps the current one; a non-blank one must still meet
+ * the minimum length.
+ */
+export function validateRestaurantInput(
+  raw: RestaurantInput,
+  { isNew }: { isNew: boolean },
+): FieldErrors<RestaurantInput> {
   const input = normalizeRestaurantInput(raw)
   const errors: FieldErrors<RestaurantInput> = {}
 
@@ -100,6 +109,13 @@ export function validateRestaurantInput(raw: RestaurantInput): FieldErrors<Resta
   if (!input.username) errors.username = 'Username is required.'
   else if (!/^[a-z0-9_-]+$/.test(input.username)) {
     errors.username = 'Username may only use letters, numbers, - and _.'
+  }
+
+  // Passwords are never trimmed: spaces are part of what the person typed.
+  if (!input.password) {
+    if (isNew) errors.password = 'Password is required.'
+  } else if (input.password.length < PASSWORD_MIN) {
+    errors.password = `Password must be at least ${PASSWORD_MIN} characters.`
   }
 
   return errors

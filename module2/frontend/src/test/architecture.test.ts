@@ -74,7 +74,12 @@ const appFiles = files.filter((f) => !isTest(f))
 describe('services layer boundary', () => {
   it('finds the source files it is guarding', () => {
     expect(appFiles.map((f) => f.path)).toEqual(
-      expect.arrayContaining(['pages/HomePage.tsx', 'services/index.ts', 'services/mock/mockService.ts']),
+      expect.arrayContaining([
+        'pages/HomePage.tsx',
+        'services/index.ts',
+        'services/mock/mockService.ts',
+        'services/http/httpService.ts',
+      ]),
     )
   })
 
@@ -85,10 +90,18 @@ describe('services layer boundary', () => {
     expect(offenders).toEqual([])
   })
 
-  it('imports the mock only from services/index.ts', () => {
+  it('makes network calls only in the HTTP implementation, never in the mock', () => {
     const offenders = appFiles
-      .filter((f) => !f.path.startsWith('services/mock/') && f.path !== 'services/index.ts')
-      .filter((f) => f.imports.some((i) => i.startsWith('services/mock')))
+      .filter((f) => f.path.startsWith('services/') && !f.path.startsWith('services/http/'))
+      .filter((f) => f.networkRefs.length > 0)
+      .map((f) => f.path)
+    expect(offenders).toEqual([])
+  })
+
+  it.each(['mock', 'http'])('imports the %s implementation only from services/index.ts', (impl) => {
+    const offenders = appFiles
+      .filter((f) => !f.path.startsWith(`services/${impl}/`) && f.path !== 'services/index.ts')
+      .filter((f) => f.imports.some((i) => i.startsWith(`services/${impl}/`)))
       .map((f) => f.path)
     expect(offenders).toEqual([])
   })

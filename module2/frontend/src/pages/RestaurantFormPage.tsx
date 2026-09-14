@@ -8,6 +8,7 @@ import {
   hasErrors,
   NO_SHOW_MINUTES_MAX,
   NO_SHOW_MINUTES_MIN,
+  PASSWORD_MIN,
   RESTAURANT_DEFAULTS,
   validateRestaurantInput,
   WAIT_MINUTES_MAX,
@@ -86,7 +87,7 @@ export function RestaurantFormPage() {
       current_wait_minutes: toNumber(values.current_wait_minutes),
       no_show_minutes: toNumber(values.no_show_minutes),
     }
-    const found = validateRestaurantInput(input)
+    const found = validateRestaurantInput(input, { isNew: !isEdit })
     setErrors(found)
     setSubmitError(null)
     if (hasErrors(found)) return
@@ -197,7 +198,11 @@ export function RestaurantFormPage() {
             <Field
               label="Password"
               error={errors.password}
-              hint={isEdit ? 'Leave blank to keep the current password.' : 'Not checked at login in this class version.'}
+              hint={
+                isEdit
+                  ? `Leave blank to keep the current password. A new one needs ${PASSWORD_MIN}+ characters.`
+                  : `At least ${PASSWORD_MIN} characters.`
+              }
             >
               {(props) => (
                 <input

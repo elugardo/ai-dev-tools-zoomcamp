@@ -49,27 +49,39 @@ describe('restaurant validation', () => {
     address: '123 Main Street',
     phone: '(555) 201-4455',
     username: 'bluebird',
+    password: 'bluebird-pass',
   }
 
   it('accepts a restaurant built on the spec defaults', () => {
     expect(RESTAURANT_DEFAULTS.current_wait_minutes).toBe(30)
     expect(RESTAURANT_DEFAULTS.no_show_minutes).toBe(10)
     expect(RESTAURANT_DEFAULTS.is_active).toBe(true)
-    expect(validateRestaurantInput(valid)).toEqual({})
+    expect(validateRestaurantInput(valid, { isNew: true })).toEqual({})
   })
 
-  it('requires name, address, phone and username', () => {
-    const errors = validateRestaurantInput(RESTAURANT_DEFAULTS)
-    expect(Object.keys(errors).sort()).toEqual(['address', 'name', 'phone', 'username'])
+  it('requires name, address, phone, username and, for a new restaurant, a password', () => {
+    const errors = validateRestaurantInput(RESTAURANT_DEFAULTS, { isNew: true })
+    expect(Object.keys(errors).sort()).toEqual(['address', 'name', 'password', 'phone', 'username'])
+  })
+
+  it('lets an edit leave the password blank to keep the current one', () => {
+    expect(validateRestaurantInput({ ...valid, password: '' }, { isNew: false })).toEqual({})
+  })
+
+  it('requires at least 8 characters for a new or changed password', () => {
+    const tooShort = 'Password must be at least 8 characters.'
+    expect(validateRestaurantInput({ ...valid, password: 'short12' }, { isNew: true }).password).toBe(tooShort)
+    expect(validateRestaurantInput({ ...valid, password: 'short12' }, { isNew: false }).password).toBe(tooShort)
+    expect(validateRestaurantInput({ ...valid, password: '12345678' }, { isNew: true })).toEqual({})
   })
 
   it('rejects negative waits and a zero no-show timeout', () => {
-    const errors = validateRestaurantInput({ ...valid, current_wait_minutes: -5, no_show_minutes: 0 })
+    const errors = validateRestaurantInput({ ...valid, current_wait_minutes: -5, no_show_minutes: 0 }, { isNew: true })
     expect(errors.current_wait_minutes).toBeDefined()
     expect(errors.no_show_minutes).toBeDefined()
   })
 
   it('rejects a username with spaces', () => {
-    expect(validateRestaurantInput({ ...valid, username: 'blue bird' }).username).toBeDefined()
+    expect(validateRestaurantInput({ ...valid, username: 'blue bird' }, { isNew: true }).username).toBeDefined()
   })
 })
