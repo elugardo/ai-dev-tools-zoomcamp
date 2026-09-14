@@ -1,6 +1,9 @@
 // Form validation (spec §8, §22). Each validator returns field -> message; an empty
 // object means valid. The mock service runs the same checks the real backend will,
 // so bypassing a form still cannot store bad data.
+//
+// The length limits match the backend's database columns (backend/app/models.py)
+// and the maxLength values in openapi.yaml.
 
 import type { JoinWaitlistInput, RestaurantInput } from './types'
 
@@ -14,6 +17,12 @@ export const WAIT_MINUTES_MAX = 240
 export const NO_SHOW_MINUTES_MIN = 1
 export const NO_SHOW_MINUTES_MAX = 120
 export const PASSWORD_MIN = 8
+export const PASSWORD_MAX = 128
+export const GUEST_NAME_MAX = 100
+export const RESTAURANT_NAME_MAX = 120
+export const ADDRESS_MAX = 200
+export const PHONE_MAX = 32
+export const USERNAME_MAX = 64
 
 export function hasErrors(errors: object): boolean {
   return Object.keys(errors).length > 0
@@ -22,7 +31,7 @@ export function hasErrors(errors: object): boolean {
 /** Basic format check only: optional +, then digits with common separators, 7–15 digits. */
 export function isValidPhone(value: string): boolean {
   const trimmed = value.trim()
-  if (!/^\+?[\d\s().-]+$/.test(trimmed)) return false
+  if (trimmed.length > PHONE_MAX || !/^\+?[\d\s().-]+$/.test(trimmed)) return false
   const digits = trimmed.replace(/\D/g, '').length
   return digits >= 7 && digits <= 15
 }
@@ -45,6 +54,9 @@ export function validateJoinInput(raw: JoinWaitlistInput): FieldErrors<JoinWaitl
   const errors: FieldErrors<JoinWaitlistInput> = {}
 
   if (!input.guest_name) errors.guest_name = 'Name is required.'
+  else if (input.guest_name.length > GUEST_NAME_MAX) {
+    errors.guest_name = `Name must be ${GUEST_NAME_MAX} characters or fewer.`
+  }
 
   if (!input.mobile_phone) errors.mobile_phone = 'Mobile phone is required.'
   else if (!isValidPhone(input.mobile_phone)) errors.mobile_phone = 'Enter a valid mobile number.'
@@ -90,7 +102,14 @@ export function validateRestaurantInput(
   const errors: FieldErrors<RestaurantInput> = {}
 
   if (!input.name) errors.name = 'Name is required.'
+  else if (input.name.length > RESTAURANT_NAME_MAX) {
+    errors.name = `Name must be ${RESTAURANT_NAME_MAX} characters or fewer.`
+  }
+
   if (!input.address) errors.address = 'Address is required.'
+  else if (input.address.length > ADDRESS_MAX) {
+    errors.address = `Address must be ${ADDRESS_MAX} characters or fewer.`
+  }
 
   if (!input.phone) errors.phone = 'Phone is required.'
   else if (!isValidPhone(input.phone)) errors.phone = 'Enter a valid phone number.'
@@ -109,6 +128,8 @@ export function validateRestaurantInput(
   if (!input.username) errors.username = 'Username is required.'
   else if (!/^[a-z0-9_-]+$/.test(input.username)) {
     errors.username = 'Username may only use letters, numbers, - and _.'
+  } else if (input.username.length > USERNAME_MAX) {
+    errors.username = `Username must be ${USERNAME_MAX} characters or fewer.`
   }
 
   // Passwords are never trimmed: spaces are part of what the person typed.
@@ -116,6 +137,8 @@ export function validateRestaurantInput(
     if (isNew) errors.password = 'Password is required.'
   } else if (input.password.length < PASSWORD_MIN) {
     errors.password = `Password must be at least ${PASSWORD_MIN} characters.`
+  } else if (input.password.length > PASSWORD_MAX) {
+    errors.password = `Password must be ${PASSWORD_MAX} characters or fewer.`
   }
 
   return errors

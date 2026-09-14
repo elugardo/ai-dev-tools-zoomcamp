@@ -9,13 +9,12 @@ The API contract is [`openapi.yaml`](openapi.yaml).
 decisions behind it, and the open items. Read it before starting work, and add a
 dated entry at the end of each session.
 
-**Where the project stands:** Phases 2 and 3 of the spec (§3) are done.
+**Where the project stands:** all four phases of the spec (§3) are done.
 
 - **Frontend:** React, calling a FastAPI backend.
-- **Backend:** FastAPI with an **in-memory store**, seeded with demo data on
-  startup.
+- **Backend:** FastAPI, persisting to a database through **SQLAlchemy**. It uses
+  SQLite by default, and the database is chosen by `WAITWISE_DATABASE_URL`.
 - **Mock:** the in-browser mock is still there for backend-free work.
-- **Not started:** Phase 4, a SQLAlchemy database.
 
 ## Commands
 
@@ -32,7 +31,7 @@ npm run build          # frontend typecheck + production build
 
 The `Makefile` in `module2/` wraps the same commands: `make install`, `make dev`
 (both servers in one terminal), `make backend`, `make frontend`, `make mock`,
-`make test` and `make build`. Keep it in step with `package.json`. Its recipes
+`make test`, `make build`, `make db-init` and `make db-reset`. Keep it in step with `package.json`. Its recipes
 use only `npm --prefix` and `uv --directory`, so they run the same under `sh` and
 Windows `cmd`. Keep `help` text free of `( ) < > | & ;` and quotes, because the
 two shells parse those differently. On this machine GNU Make comes from winget
@@ -44,6 +43,8 @@ Backend, from `module2/backend/`:
 uv run uvicorn app.main:app --reload --port 9127
 uv run pytest                                   # whole backend suite
 uv run pytest tests/test_auth.py -k expires     # one file / one test
+uv run python -m app.manage reset-db            # drop, recreate and reseed the database
+uv run python -m app.manage init-db             # create missing tables (startup does this too)
 ```
 
 Frontend, from `module2/frontend/`:
@@ -84,15 +85,18 @@ module2/
 │   ├── auth/ hooks/ components/ pages/ test/
 └── backend/
     ├── app/
-    │   ├── main.py         create_app(): CORS, error handlers, routers under /api
-    │   ├── config.py       Settings from WAITWISE_* environment variables
+    │   ├── main.py         create_app(): DB setup + seed, CORS, error handlers, routers under /api
+    │   ├── config.py       Settings from WAITWISE_* environment variables (incl. DATABASE_URL)
+    │   ├── db.py           engine, per-request session, UTCDateTime; ALL database-specific code
+    │   ├── tables.py       SQLAlchemy ORM tables, portable types only
     │   ├── models.py       Pydantic request/response models + enums + field validation
     │   ├── rules.py        pure waitlist rules (transitions, position, no-show, history)
-    │   ├── store.py        in-memory Store: records, tokens, locked operations
-    │   ├── auth.py         scrypt hashing, bearer tokens, role dependencies
-    │   ├── serializers.py  records → response models (positions, counts)
-    │   ├── errors.py       ApiError subclasses → the Error body
-    │   ├── seed.py         demo data
+    │   ├── store.py        Store: every query and write, over one request's session
+    │   ├── auth.py         scrypt hashing, bearer tokens, session/store/role dependencies
+    │   ├── serializers.py  ORM rows → response models (positions, counts)
+    │   ├── errors.py       ApiError subclasses (+ IntegrityError) → the Error body
+    │   ├── seed.py         demo data, loaded only into an empty database
+    │   ├── manage.py       `python -m app.manage init-db | seed | reset-db`
     │   └── routers/        auth.py, public.py, restaurant.py, admin.py
     └── tests/              pytest + TestClient; conftest.py has the fixtures
 ```
@@ -134,23 +138,57 @@ module2/
 
 ### Backend
 
-- **Routers stay thin.** Each one validates input with a Pydantic model, runs
-  inside `with store.transaction():`, calls `Store` operations and serializes
-  the result.
+- **Routers stay thin.** Each one validates input with a Pydantic model, calls
+  `Store` operations and serializes the result. None of them manage
+  transactions.
+- **One transaction per request.** `db.get_session` is declared with
+  `Depends(..., scope="function")`. It commits after the endpoint returns but
+  before the response is sent, and any exception rolls the whole request back.
+  `auth.get_store` wraps that session and runs the automatic no-show sweep first
+  (spec §14), so there is no background worker.
 - **The store owns the data and its invariants.** That includes username
-  uniqueness, the closed-waitlist check, transitions, and token revocation when
-  a password changes.
-- **Locking and the no-show sweep.** Every store method holds a re-entrant
-  lock, and `transaction()` makes the whole request atomic. It also runs the
-  automatic no-show sweep first (spec §14), so there is no background worker.
+  uniqueness (checked first, with the unique constraint as a backstop that maps
+  to 409), the closed-waitlist check, transitions, and token revocation when a
+  password changes.
+- **Concurrent writes** use conditional UPDATEs (`WHERE id = … AND status =
+  expected`), checking the row count. A stale request re-decides against the
+  current status and never overwrites a newer one. This needs no row locks, so
+  it behaves the same on every database.
 - **Rules are pure.** `rules.py` functions take `now` as an argument. `Store`
   takes a `clock`, and tests pass a hand-cranked one.
 - **Validation messages.** Pydantic validators raise `ValueError` with the same
   messages as `frontend/src/domain/validation.ts`, and `errors.py` maps them
-  into `field_errors`. Keep the two in sync.
-- **The store is in memory.** Restarting uvicorn, including a `--reload`,
-  resets the data to the seed and signs everyone out. Phase 4 will replace
-  `store.py` with SQLAlchemy.
+  into `field_errors`. Keep the two in sync. That includes the **length limits,
+  which must match the column sizes in `tables.py`**: SQLite ignores them, but
+  Postgres and others reject overlong values.
+
+### Database
+
+- **Choosing the database.** `WAITWISE_DATABASE_URL` is any SQLAlchemy URL.
+  - The default is `sqlite:///<backend>/waitwise.db`, which is gitignored.
+  - `sqlite://` gives a throwaway in-memory database.
+  - Another database needs only its driver added with `uv add` and a URL such as
+    `postgresql+psycopg://user:pass@host/waitwise`.
+- **Keep it database-agnostic.**
+  - All dialect-specific code lives in `db.py`: SQLite pragmas, `StaticPool`
+    for in-memory databases, WAL.
+  - Everywhere else uses ORM queries and generic types only. No
+    `sqlalchemy.text`, no `sqlalchemy.dialects` imports, no database functions.
+    Do date arithmetic in Python.
+  - `tests/test_database.py` enforces this. It checks column types (strings need
+    a length, enums must be non-native) and banned imports and strings in
+    `app/`. It also compiles the schema for PostgreSQL, MySQL and SQL Server.
+- **Timestamps** use `UTCDateTime`. It stores naive UTC, returns aware UTC, and
+  refuses naive input.
+- **Schema.** `create_schema()` (SQLAlchemy `create_all`) runs at startup. It
+  creates missing tables but never alters existing ones, and there is no
+  migration tool. After changing a table, run `make db-reset`, which deletes
+  the data. Add Alembic before any schema change must keep existing data.
+- **Seed data** loads only into an empty database, so restarts never duplicate
+  it. The demo queue's timestamps are fixed at seeding time and go stale; run
+  `make db-reset` for a fresh demo.
+- **Login tokens** persist, stored as SHA-256 hashes, so sessions survive
+  restarts. Expired tokens are purged at the next login.
 
 ### Authentication
 
@@ -160,8 +198,8 @@ and §39 excludes hashing. It was added at the project owner's request.
 - **Passwords.** Hashed with stdlib `hashlib.scrypt`, with a random salt and the
   parameters stored alongside as `scrypt$n$r$p$salt$hash`, and compared in
   constant time. They are never returned by any endpoint.
-- **Login.** Returns an opaque `secrets.token_urlsafe` bearer token, held in the
-  store. There is no JWT.
+- **Login.** Returns an opaque `secrets.token_urlsafe` bearer token. The
+  database stores only its SHA-256 hash. There is no JWT.
   - A token expires after `WAITWISE_TOKEN_TTL_MINUTES` (default 12 h).
   - Changing a restaurant's password revokes its tokens.
   - A wrong password and an unknown username get the same 401 message.
@@ -201,12 +239,20 @@ and §39 excludes hashing. It was added at the project owner's request.
 
 **Backend (pytest)**
 
-- Every test gets a fresh app and store from `conftest.py`:
+- Every test gets a fresh app and a fresh database from `conftest.py`:
   - `api`: the demo seed.
   - `quiet_api`: the seed without waitlist entries.
   - `empty_api`: no data at all.
+- **Test database.** The default is in-memory SQLite, created per test. Set
+  `WAITWISE_TEST_DATABASE_URL` to run the whole suite on another database. Its
+  tables are dropped before every test, so never point it at real data.
 - `api.clock.advance(minutes=…)` moves time. `api.login("bluebird")` returns
-  auth headers. Hashing uses a low scrypt cost in tests, so keep it that way.
+  auth headers. `with api.db() as store:` arranges or inspects rows directly,
+  in its own committed transaction. Hashing uses a low scrypt cost in tests, so
+  keep it that way.
+- **File-backed tests.** Persistence and concurrency tests need a real file,
+  because two sessions on in-memory SQLite share one connection. Use `tmp_path`
+  with `api_for(clock, database_url=...)`.
 - Test through HTTP with `TestClient`. Use `test_rules.py` for pure rules.
 - New endpoints or response codes belong in `openapi.yaml` and in
   `test_contract.py`'s scenario. Its final assertions require that every
@@ -227,9 +273,12 @@ and §39 excludes hashing. It was added at the project owner's request.
   because one jsdom worker per core exhausts memory and workers then time out
   on startup.
 
-## Next phase (not started)
+## Next steps (not started)
 
-**Phase 4:** SQLAlchemy models (§25) replace `store.py`. SQLite is the local
-default, with the database URL taken from the environment so PostgreSQL works
-in production. The routers, the contract and the tests should not need to
-change.
+- **Postgres support:**
+  1. Add a driver (`uv add psycopg[binary]`).
+  2. Run the test suite with `WAITWISE_TEST_DATABASE_URL` pointing at a
+     disposable database.
+  3. Fix anything that shows up. The code already avoids SQLite-only behavior.
+- **Migrations:** add Alembic before the first schema change that has to keep
+  existing data.

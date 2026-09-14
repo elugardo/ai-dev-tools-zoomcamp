@@ -8,6 +8,7 @@ never for developers.
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import IntegrityError
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 
@@ -110,6 +111,15 @@ def install_error_handlers(app: FastAPI) -> None:
         field_errors = _field_errors_from(exc)
         message = "Please fix the highlighted fields." if field_errors else "The request could not be understood."
         return JSONResponse(status_code=422, content=error_body("VALIDATION", message, field_errors))
+
+    @app.exception_handler(IntegrityError)
+    async def handle_integrity_error(_: Request, __: IntegrityError) -> JSONResponse:
+        # Validation and explicit checks catch conflicts first. This is the backstop
+        # for a race between two requests, e.g. two admins creating one username.
+        return JSONResponse(
+            status_code=409,
+            content=error_body("CONFLICT", "That change conflicts with existing data. Please refresh and try again."),
+        )
 
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:

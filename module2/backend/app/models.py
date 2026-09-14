@@ -18,6 +18,14 @@ DESCRIPTION_MAX = 500
 WAIT_MINUTES_MAX = 240
 NO_SHOW_MINUTES_MIN, NO_SHOW_MINUTES_MAX = 1, 120
 PASSWORD_MIN = 8
+# Column lengths. Postgres and others enforce these; SQLite does not, so they are
+# validated here first, where a violation is a friendly 422 instead of a DB error.
+GUEST_NAME_MAX = 100
+RESTAURANT_NAME_MAX = 120
+ADDRESS_MAX = 200
+PHONE_MAX = 32
+USERNAME_MAX = 64
+PASSWORD_MAX = 128
 
 Trimmed = Annotated[str, StringConstraints(strip_whitespace=True)]
 
@@ -47,7 +55,7 @@ _PHONE_CHARS = re.compile(r"^\+?[\d\s().-]+$")
 
 def is_valid_phone(value: str) -> bool:
     """Basic format check only: optional +, digits with common separators, 7-15 digits."""
-    if not _PHONE_CHARS.match(value):
+    if len(value) > PHONE_MAX or not _PHONE_CHARS.match(value):
         return False
     digits = sum(ch.isdigit() for ch in value)
     return 7 <= digits <= 15
@@ -87,6 +95,8 @@ class LoginRequest(BaseModel):
     def _password(cls, value: str) -> str:
         if not value:
             raise ValueError("Password is required.")
+        if len(value) > PASSWORD_MAX:
+            raise ValueError("Incorrect username or password.")
         return value
 
 
@@ -142,6 +152,8 @@ class RestaurantRequest(BaseModel):
     def _name(cls, value: str) -> str:
         if not value:
             raise ValueError("Name is required.")
+        if len(value) > RESTAURANT_NAME_MAX:
+            raise ValueError(f"Name must be {RESTAURANT_NAME_MAX} characters or fewer.")
         return value
 
     @field_validator("address")
@@ -149,6 +161,8 @@ class RestaurantRequest(BaseModel):
     def _address(cls, value: str) -> str:
         if not value:
             raise ValueError("Address is required.")
+        if len(value) > ADDRESS_MAX:
+            raise ValueError(f"Address must be {ADDRESS_MAX} characters or fewer.")
         return value
 
     @field_validator("phone")
@@ -190,6 +204,8 @@ class RestaurantRequest(BaseModel):
             raise ValueError("Username is required.")
         if not re.fullmatch(r"[a-z0-9_-]+", value):
             raise ValueError("Username may only use letters, numbers, - and _.")
+        if len(value) > USERNAME_MAX:
+            raise ValueError(f"Username must be {USERNAME_MAX} characters or fewer.")
         return value
 
 
@@ -201,6 +217,8 @@ class RestaurantCreateRequest(RestaurantRequest):
             raise ValueError("Password is required.")
         if len(value) < PASSWORD_MIN:
             raise ValueError(f"Password must be at least {PASSWORD_MIN} characters.")
+        if len(value) > PASSWORD_MAX:
+            raise ValueError(f"Password must be {PASSWORD_MAX} characters or fewer.")
         return value
 
 
@@ -211,6 +229,8 @@ class RestaurantUpdateRequest(RestaurantRequest):
         # Blank keeps the current password.
         if value and len(value) < PASSWORD_MIN:
             raise ValueError(f"Password must be at least {PASSWORD_MIN} characters.")
+        if len(value) > PASSWORD_MAX:
+            raise ValueError(f"Password must be {PASSWORD_MAX} characters or fewer.")
         return value
 
 
@@ -242,6 +262,8 @@ class JoinWaitlistRequest(BaseModel):
     def _name(cls, value: str) -> str:
         if not value:
             raise ValueError("Name is required.")
+        if len(value) > GUEST_NAME_MAX:
+            raise ValueError(f"Name must be {GUEST_NAME_MAX} characters or fewer.")
         return value
 
     @field_validator("mobile_phone")

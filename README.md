@@ -199,15 +199,17 @@ It is deliberately not a reservation, table-management or POS system. The full
 spec is in
 [`module2/_docs/`](module2/_docs/WaitWise_Restaurant_Waitlist_Manager_Specification.md).
 
-### Status: frontend and backend complete
+### Status: frontend, backend and database complete
 
 The course builds this in phases: scope, then frontend, then backend, then
-database.
+database. All of them are done.
 
 - **Phase 2, frontend:** done.
-- **Phase 3, backend:** done. A FastAPI server with an in-memory store, seeded
-  with demo data on startup.
-- **Phase 4, database:** SQLAlchemy, not started.
+- **Phase 3, backend:** done. A FastAPI server.
+- **Phase 4, database:** done. The backend persists to a database through
+  SQLAlchemy. It uses SQLite by default, and `WAITWISE_DATABASE_URL` selects
+  another database. The code is database-agnostic, so adding Postgres later
+  needs a driver and a URL, not code changes.
 
 The two halves meet at a single contract, [`module2/openapi.yaml`](module2/openapi.yaml):
 
@@ -216,8 +218,8 @@ The two halves meet at a single contract, [`module2/openapi.yaml`](module2/opena
   two implementations. The default HTTP client calls the FastAPI backend. An
   in-browser mock enforces the same rules, so the UI still runs with no server
   (`npm run dev:mock`).
-- **Backend.** Split into routers, models, store and auth modules, and serves
-  exactly the operations in `openapi.yaml`.
+- **Backend.** Split into routers, models, store, auth and database modules,
+  and serves exactly the operations in `openapi.yaml`.
 - **Tests on both sides** check the code against the spec, so the two can't
   drift apart.
 
@@ -230,10 +232,10 @@ restaurant's password revokes its tokens.
 
 - **Frontend:** React 19, TypeScript, Vite, React Router, plain CSS; Vitest and
   React Testing Library
-- **Backend:** Python 3.13, FastAPI, Pydantic, uvicorn; pytest with FastAPI's
-  TestClient; managed with [uv](https://docs.astral.sh/uv/)
-- **Planned for Phase 4:** SQLAlchemy, with SQLite locally and PostgreSQL in
-  production
+- **Backend:** Python 3.13, FastAPI, Pydantic, SQLAlchemy 2.0, uvicorn; pytest
+  with FastAPI's TestClient; managed with [uv](https://docs.astral.sh/uv/)
+- **Database:** SQLite by default (`backend/waitwise.db`), selected with
+  `WAITWISE_DATABASE_URL`; designed to add PostgreSQL next
 
 Needs Node 20.19+ or 22.12+, Python 3.13, and uv.
 
@@ -253,7 +255,8 @@ commands above.
 If you have GNU make, `module2/Makefile` wraps the same commands. `make install`
 installs dependencies, and `make dev` starts the backend and frontend together
 in one terminal; Ctrl+C stops both. `make mock` runs the frontend on the mock,
-`make test` runs every test, and `make` on its own lists all targets.
+`make test` runs every test, and `make db-reset` rebuilds the database with fresh
+demo data. `make` on its own lists all targets.
 
 Demo accounts come from the seed data. All of them use the password `password`:
 
@@ -276,8 +279,14 @@ A quick demo of the core scenario:
 Seeded eater pages have readable links, such as
 `http://localhost:3417/wait/demo-sarah`.
 
-The backend keeps its data in memory. Restarting it resets everything to the
-seed and signs everyone out.
+The backend stores everything in `module2/backend/waitwise.db`, so data and
+logins survive restarts. Demo data loads only into an empty database, and its
+timestamps are fixed at that moment. For a fresh demo queue, run `make db-reset`
+(or `uv run python -m app.manage reset-db` from `backend/`). That deletes all
+data.
+
+To use a different database, set `WAITWISE_DATABASE_URL` to any SQLAlchemy URL
+before starting the backend, for example `sqlite:///C:/data/waitwise.db`.
 
 ### Layout
 
@@ -295,13 +304,15 @@ module2/
 │       └── styles.css
 ├── backend/
 │   ├── app/
-│   │   ├── main.py       app factory: CORS, error handlers, routers under /api
+│   │   ├── main.py       app factory: database setup, CORS, error handlers, routers under /api
 │   │   ├── routers/      auth, public (restaurants + eater waitlist), restaurant, admin
 │   │   ├── models.py     Pydantic request/response models
-│   │   ├── store.py      in-memory store
+│   │   ├── store.py      every query and write, over a SQLAlchemy session
+│   │   ├── db.py         engine, sessions, UTC timestamps - all database-specific code
+│   │   ├── tables.py     SQLAlchemy ORM tables
 │   │   ├── auth.py       password hashing, bearer tokens, role checks
 │   │   ├── rules.py      pure waitlist rules
-│   │   └── seed.py, config.py, errors.py, serializers.py
+│   │   └── seed.py, manage.py, config.py, errors.py, serializers.py
 │   ├── tests/
 │   └── pyproject.toml, uv.lock
 ├── package.json    scripts: setup, dev, dev:backend, dev:mock, build, test:all
@@ -316,7 +327,7 @@ cd module2
 npm run test:all
 ```
 
-This runs 321 tests: 160 in the frontend (Vitest), then 161 in the backend
+This runs 357 tests: 163 in the frontend (Vitest), then 194 in the backend
 (pytest).
 
 - **Backend:**
@@ -327,6 +338,9 @@ This runs 321 tests: 160 in the frontend (Vitest), then 161 in the backend
     clock.
   - **Contract:** drives all 15 operations and validates each status code and
     response body against `openapi.yaml`.
+  - **Database:** persistence across restarts, rollback of failed requests,
+    safe concurrent updates, and portability checks, including compiling the
+    schema for PostgreSQL, MySQL and SQL Server.
 - **Frontend:**
   - **Domain rules:** the business rules as pure functions.
   - **HTTP client:** every request and error mapping, checked against the

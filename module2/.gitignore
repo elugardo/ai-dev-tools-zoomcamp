@@ -6,3 +6,9 @@ coverage/
 .env.local
 .env.*.local
 !.env.example
+
+# Local SQLite databases (the default WAITWISE_DATABASE_URL writes backend/waitwise.db)
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

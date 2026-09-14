@@ -120,7 +120,11 @@ class TestRoles:
 
     def test_restaurant_endpoints_check_the_role_not_just_a_restaurant_id(self, api):
         # The API never creates such a user, but the role is what grants access.
-        api.store.add_user("odd-admin", hash_password("password", n=FAST_SCRYPT_N), UserRole.ADMIN, 1)
+        # (restaurant_id is unique, so first move Bluebird's own login off it.)
+        with api.db() as store:
+            store.restaurant_login(1).restaurant_id = None
+            store.session.flush()
+            store.add_user("odd-admin", hash_password("password", n=FAST_SCRYPT_N), UserRole.ADMIN, 1)
         response = api.get("/restaurant/waitlist", headers=api.login("odd-admin"))
         assert response.status_code == 403
 
