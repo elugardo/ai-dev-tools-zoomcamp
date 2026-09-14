@@ -1,0 +1,1048 @@
+openapi: 3.1.0
+
+info:
+  title: WaitWise API
+  version: 0.1.0
+  summary: The backend contract the WaitWise frontend is built against.
+  description: |
+    The HTTP API the WaitWise React frontend expects. Every operation here maps
+    one-to-one to a method on `WaitWiseService`
+    (`frontend/src/services/WaitWiseService.ts`), named in each operation's
+    `x-service-method`. Request and response shapes mirror
+    `frontend/src/domain/types.ts`. The in-browser mock
+    (`frontend/src/services/mock/mockService.ts`) is the reference
+    implementation of the behavior described here.
+
+    ## Conventions
+
+    - JSON in and out. Field names are `snake_case`.
+    - Timestamps are ISO-8601 `date-time` strings in UTC, for example
+      `2026-09-14T18:30:00.000Z`.
+    - IDs are integers. Eater waitlist entries are also addressed by an opaque
+      `public_token` so eaters never see or guess numeric IDs.
+    - The frontend runs at `http://localhost:3417`, so the backend must allow
+      CORS from that origin, including the `Authorization` header and the
+      `PATCH`, `PUT` and `DELETE` methods.
+
+    ## Authentication
+
+    Deliberately simplified for the class project (spec §5).
+
+    - `POST /auth/login` takes a username and a password. **The password is
+      ignored**: any value, including an empty string, is accepted for a known
+      username. Usernames are matched after trimming and lowercasing.
+    - The response carries an opaque `token`. The frontend stores it in
+      `localStorage` and sends it on staff and admin calls as
+      `Authorization: Bearer <token>`.
+    - There is no JWT, refresh, expiry or logout endpoint. An unknown or stale
+      token gets `401`, and the frontend then sends the user back to the login
+      page.
+    - Public and eater endpoints need no token. Restaurant endpoints need a
+      `RESTAURANT` user and always act on **that user's own restaurant**. Admin
+      endpoints need the `ADMIN` user. The wrong role gets `403`.
+
+    ## Errors
+
+    Every non-2xx response has an `Error` body. The frontend shows `message`
+    to the user as-is, so it must be friendly and must never contain stack
+    traces or raw exception text (spec §31). `code` is what the frontend
+    branches on. `field_errors` maps request field names to messages and is
+    shown next to the matching form input.
+
+    | HTTP | `code`            | When |
+    |------|-------------------|------|
+    | 401  | `UNAUTHORIZED`    | Missing or unknown token; unknown username at login |
+    | 403  | `FORBIDDEN`       | Valid token, wrong role |
+    | 404  | `NOT_FOUND`       | Restaurant, token or entry does not exist (or belongs to another restaurant) |
+    | 409  | `WAITLIST_CLOSED` | Online join while the restaurant is inactive or paused |
+    | 409  | `ENTRY_CLOSED`    | Change to an entry that is already `SEATED`, `CANCELED` or `NO_SHOW` |
+    | 409  | `CONFLICT`        | Restaurant username already taken |
+    | 422  | `VALIDATION`      | Invalid input, or a disallowed status change on an active entry |
+
+    Validation errors must use this `Error` shape, not FastAPI's default
+    `{"detail": [...]}` body. The frontend also has an `UNAVAILABLE` code, which
+    it raises itself when the backend cannot be reached. The server never
+    sends it.
+
+    ## Business rules the backend owns
+
+    - **Frozen quote.** On join, `quoted_wait_minutes` is copied from the
+      restaurant's `current_wait_minutes`, and
+      `estimated_ready_at = joined_at + quoted_wait_minutes`. Neither is ever
+      recomputed, even if the restaurant later changes its wait (spec §9).
+    - **Derived position.** `position` is never stored. It is the 1-based
+      index among the restaurant's `WAITING` and `NOTIFIED` entries ordered by
+      `joined_at`, ties broken by `id`. It is `null` for finished entries
+      (spec §27).
+    - **Status transitions** (spec §12):
+      `WAITING → NOTIFIED | SEATED | CANCELED | NO_SHOW` and
+      `NOTIFIED → SEATED | CANCELED | NO_SHOW`. Moving into a status stamps its
+      timestamp (`notified_at`, `seated_at`, `canceled_at`, `no_show_at`).
+      Nothing moves back to `WAITING`.
+    - **Automatic no-show** (spec §14). A `NOTIFIED` entry becomes `NO_SHOW`
+      once `now >= notified_at + no_show_minutes`, with
+      `no_show_at = notified_at + no_show_minutes`. There is no background
+      worker. Apply this sweep before answering any request that returns
+      waitlist data, at least `GET /waitlist/{token}` and
+      `GET /restaurant/waitlist`. The mock sweeps on every request, which also
+      keeps `waiting_parties` counts accurate.
+    - **Polling.** The eater status page and the staff dashboard each poll
+      their GET endpoint every 10 seconds. Keep those two endpoints cheap.
+
+servers:
+  - url: http://localhost:9127/api
+    description: Local development backend
+
+tags:
+  - name: Auth
+    description: Staff and admin login. Public.
+  - name: Public restaurants
+    description: What eaters browse. Public.
+  - name: Eater waitlist
+    description: Joining, checking and leaving a waitlist. Public; an entry is addressed by its token.
+  - name: Restaurant operations
+    description: The restaurant dashboard. Requires a RESTAURANT user.
+  - name: Admin
+    description: Managing restaurants and their logins. Requires the ADMIN user.
+
+# Nothing is authenticated by default; protected operations opt in below.
+security: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      x-service-method: login
+      summary: Log in as the admin or a restaurant
+      description: |
+        Looks up the user by username (trimmed, case-insensitive). The password
+        is accepted but not checked. The frontend then sends the user to
+        `/admin` for `ADMIN` or `/restaurant/dashboard` for `RESTAURANT`.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            example: { username: bluebird, password: anything }
+      responses:
+        '200':
+          description: Logged in.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResult' }
+              example:
+                token: 3f6c1d2e-9a41-4b7e-8c55-0d2f7a9b1e64
+                user: { id: 2, username: bluebird, role: RESTAURANT, restaurant_id: 1 }
+        '401':
+          $ref: '#/components/responses/UnknownUsername'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurants:
+    get:
+      tags: [Public restaurants]
+      operationId: getRestaurants
+      x-service-method: getRestaurants
+      summary: List active restaurants
+      description: |
+        Returns **active restaurants only**, sorted by name. A restaurant whose
+        online waitlist is paused is still listed, with
+        `online_waitlist_enabled: false`. An empty array is a valid response.
+      security: []
+      responses:
+        '200':
+          description: Active restaurants, sorted by name.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/PublicRestaurant' }
+
+  /restaurants/{restaurant_id}:
+    parameters:
+      - $ref: '#/components/parameters/RestaurantId'
+    get:
+      tags: [Public restaurants]
+      operationId: getRestaurant
+      x-service-method: getRestaurant
+      summary: Get one restaurant's public details
+      description: |
+        Returns the restaurant even when it is inactive (`is_active: false`).
+        The page then shows it with joining disabled. `404` only when the ID
+        does not exist.
+      security: []
+      responses:
+        '200':
+          description: The restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicRestaurant' }
+        '404':
+          $ref: '#/components/responses/RestaurantNotFound'
+
+  /restaurants/{restaurant_id}/waitlist:
+    parameters:
+      - $ref: '#/components/parameters/RestaurantId'
+    post:
+      tags: [Eater waitlist]
+      operationId: joinWaitlist
+      x-service-method: joinWaitlist
+      summary: Join a restaurant's waitlist online
+      description: |
+        Creates an entry with `status: WAITING` and `source: ONLINE`, a newly
+        generated `public_token`, a frozen quote, and `joined_at` set to now.
+        The frontend immediately navigates to `/wait/{public_token}`.
+
+        Refused with `409 WAITLIST_CLOSED` when the restaurant is inactive or
+        `online_waitlist_enabled` is false.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JoinWaitlistRequest' }
+            example: { guest_name: Marcos, mobile_phone: 555-010-6677, party_size: 4, notes: '' }
+      responses:
+        '201':
+          description: Joined. The body is the eater's view of the new entry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EaterWaitlistView' }
+        '404':
+          $ref: '#/components/responses/RestaurantNotFound'
+        '409':
+          description: The restaurant is not accepting online entries.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example:
+                code: WAITLIST_CLOSED
+                message: Bluebird Cafe isn't accepting online waitlist entries right now.
+                field_errors: {}
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /waitlist/{token}:
+    parameters:
+      - $ref: '#/components/parameters/PublicToken'
+    get:
+      tags: [Eater waitlist]
+      operationId: getWaitlistEntry
+      x-service-method: getWaitlistEntry
+      summary: Get an eater's entry (polled every 10 s)
+      description: |
+        The eater status page polls this every 10 seconds while the entry is
+        `WAITING` or `NOTIFIED`, and stops once it is finished. Apply the
+        automatic no-show sweep first. Finished entries stay readable, so an
+        eater can see they were seated, canceled or marked a no-show.
+      security: []
+      responses:
+        '200':
+          description: The entry as the eater sees it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EaterWaitlistView' }
+        '404':
+          $ref: '#/components/responses/EntryNotFound'
+    delete:
+      tags: [Eater waitlist]
+      operationId: cancelWaitlistEntry
+      x-service-method: cancelWaitlistEntry
+      summary: Leave the waitlist
+      description: |
+        Moves an active entry to `CANCELED` and stamps `canceled_at`. This is a
+        status change, not a hard delete: the entry stays readable and shows
+        in the restaurant's history. Returns `200` with the updated entry, not
+        `204`, because the page renders the result.
+      security: []
+      responses:
+        '200':
+          description: Canceled. `status` is `CANCELED` and `position` is null.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EaterWaitlistView' }
+        '404':
+          $ref: '#/components/responses/EntryNotFound'
+        '409':
+          $ref: '#/components/responses/EntryClosed'
+
+  /restaurant/waitlist:
+    get:
+      tags: [Restaurant operations]
+      operationId: getRestaurantWaitlist
+      x-service-method: getRestaurantWaitlist
+      summary: Get the signed-in restaurant's dashboard data (polled every 10 s)
+      description: |
+        Everything the dashboard renders, in one call. Apply the automatic
+        no-show sweep first.
+
+        - `restaurant`: the signed-in user's restaurant, including settings.
+        - `active`: `WAITING` and `NOTIFIED` entries in queue order, each with
+          its `position`.
+        - `history`: today's `SEATED`, `CANCELED` and `NO_SHOW` entries, most
+          recently finished first. "Today" is decided by the final status
+          timestamp. The mock uses the browser's local day; the backend should
+          use one fixed local timezone.
+      security:
+        - bearerAuth: []
+      x-required-role: RESTAURANT
+      responses:
+        '200':
+          description: Restaurant, active queue and today's history.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RestaurantWaitlist' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Restaurant operations]
+      operationId: addWalkIn
+      x-service-method: addWalkIn
+      summary: Add a walk-in party
+      description: |
+        Same as an online join, except `source` is `STAFF`. It gets the same
+        frozen quote from `current_wait_minutes`. **Allowed even when the
+        online waitlist is paused or the restaurant is inactive.** Staff stay
+        in control of their own door.
+      security:
+        - bearerAuth: []
+      x-required-role: RESTAURANT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/JoinWaitlistRequest' }
+            example: { guest_name: Dana, mobile_phone: 555-010-3030, party_size: 2, notes: Booth if possible }
+      responses:
+        '201':
+          description: Added to the back of the queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StaffWaitlistEntry' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /restaurant/waitlist/{entry_id}:
+    parameters:
+      - name: entry_id
+        in: path
+        required: true
+        description: Waitlist entry ID. Must belong to the signed-in user's restaurant.
+        schema: { type: integer, minimum: 1 }
+    patch:
+      tags: [Restaurant operations]
+      operationId: updateWaitlistEntry
+      x-service-method: updateWaitlistEntry
+      summary: Notify, seat, cancel or mark a party as a no-show
+      description: |
+        Changes an entry's status and stamps the matching timestamp. Staff may
+        act on any active party regardless of position (spec §15).
+
+        - An entry that belongs to another restaurant gets `404`, the same as
+          one that does not exist.
+        - An entry that is already finished gets `409 ENTRY_CLOSED`.
+        - A transition the table does not allow from an active status, such as
+          `NOTIFIED → NOTIFIED`, gets `422 VALIDATION`.
+      security:
+        - bearerAuth: []
+      x-required-role: RESTAURANT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateWaitlistEntryRequest' }
+            example: { status: NOTIFIED }
+      responses:
+        '200':
+          description: The updated entry. `position` is null if it left the active queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StaffWaitlistEntry' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No such entry at this restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: NOT_FOUND, message: "We couldn't find that party.", field_errors: {} }
+        '409':
+          $ref: '#/components/responses/EntryClosed'
+        '422':
+          description: Status change not allowed from the entry's current active status, or invalid body.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+              example: { code: VALIDATION, message: "That status change isn't allowed.", field_errors: {} }
+
+  /restaurant/settings:
+    patch:
+      tags: [Restaurant operations]
+      operationId: updateRestaurantSettings
+      x-service-method: updateRestaurantSettings
+      summary: Change the current wait or pause online joining
+      description: |
+        Partial update of the signed-in user's restaurant. Omitted fields are
+        left unchanged. The dashboard sends one field at a time: **Change
+        Wait** sends `current_wait_minutes`, and the **Accepting Online
+        Waitlist** toggle sends `online_waitlist_enabled`. Changing the wait
+        affects only parties who join afterwards.
+      security:
+        - bearerAuth: []
+      x-required-role: RESTAURANT
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RestaurantSettingsRequest' }
+            examples:
+              changeWait: { summary: Change Wait, value: { current_wait_minutes: 45 } }
+              pauseOnline: { summary: Pause online joining, value: { online_waitlist_enabled: false } }
+      responses:
+        '200':
+          description: The updated restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRestaurant' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants:
+    get:
+      tags: [Admin]
+      operationId: getAdminRestaurants
+      x-service-method: getAdminRestaurants
+      summary: List all restaurants, including inactive ones
+      security:
+        - bearerAuth: []
+      x-required-role: ADMIN
+      responses:
+        '200':
+          description: Every restaurant, sorted by name, with its login username.
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/AdminRestaurant' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Admin]
+      operationId: createRestaurant
+      x-service-method: createRestaurant
+      summary: Create a restaurant and its login
+      description: |
+        Creates the restaurant and its single `RESTAURANT` user together. New
+        restaurants always start with `online_waitlist_enabled: true`, which is
+        not part of the request. The form's defaults are a 30-minute wait, a
+        10-minute no-show timeout and active (spec §22). The frontend returns
+        to `/admin` on success.
+      security:
+        - bearerAuth: []
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RestaurantRequest' }
+            example:
+              name: Harbor Noodle
+              address: 789 Pier Road
+              phone: (555) 400-1234
+              description: Hand-pulled noodles.
+              current_wait_minutes: 30
+              no_show_minutes: 10
+              is_active: true
+              username: harbor
+              password: anything
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRestaurant' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/UsernameTaken'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurant_id}:
+    parameters:
+      - $ref: '#/components/parameters/RestaurantId'
+    get:
+      tags: [Admin]
+      operationId: getAdminRestaurant
+      x-service-method: getAdminRestaurant
+      summary: Get one restaurant for the edit form
+      description: The password is never returned. The edit form starts with it blank.
+      security:
+        - bearerAuth: []
+      x-required-role: ADMIN
+      responses:
+        '200':
+          description: The restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRestaurant' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/RestaurantNotFound'
+    put:
+      tags: [Admin]
+      operationId: updateRestaurant
+      x-service-method: updateRestaurant
+      summary: Edit a restaurant and its login
+      description: |
+        Full replacement of the editable fields. The whole form is sent every
+        time. **An empty `password` keeps the current password.** Changing
+        `username` renames the restaurant's login, and the old username stops
+        working. `online_waitlist_enabled` is not part of this request and is
+        left unchanged.
+      security:
+        - bearerAuth: []
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RestaurantRequest' }
+      responses:
+        '200':
+          description: The updated restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRestaurant' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/RestaurantNotFound'
+        '409':
+          $ref: '#/components/responses/UsernameTaken'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /admin/restaurants/{restaurant_id}/status:
+    parameters:
+      - $ref: '#/components/parameters/RestaurantId'
+    patch:
+      tags: [Admin]
+      operationId: setRestaurantStatus
+      x-service-method: setRestaurantStatus
+      summary: Activate or deactivate a restaurant
+      description: |
+        Inactive restaurants disappear from `GET /restaurants` and refuse online
+        joins. Their staff can still log in and use the dashboard.
+      security:
+        - bearerAuth: []
+      x-required-role: ADMIN
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RestaurantStatusRequest' }
+            example: { is_active: false }
+      responses:
+        '200':
+          description: The updated restaurant.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AdminRestaurant' }
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/RestaurantNotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        The opaque `token` returned by `POST /auth/login`. It identifies a user;
+        it is not a JWT. Each operation's `x-required-role` names the role it
+        needs.
+
+  parameters:
+    RestaurantId:
+      name: restaurant_id
+      in: path
+      required: true
+      schema: { type: integer, minimum: 1 }
+    PublicToken:
+      name: token
+      in: path
+      required: true
+      description: The entry's `public_token`, taken from the eater's `/wait/{token}` URL.
+      schema: { type: string, minLength: 1 }
+
+  responses:
+    Unauthorized:
+      description: Missing, unknown or stale token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: UNAUTHORIZED, message: Your session has expired. Please log in again., field_errors: {} }
+    UnknownUsername:
+      description: No user has that username.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: UNAUTHORIZED, message: "We don't recognize that username.", field_errors: {} }
+    Forbidden:
+      description: Signed in, but with the wrong role for this endpoint.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: FORBIDDEN, message: "You don't have access to that page.", field_errors: {} }
+    RestaurantNotFound:
+      description: No restaurant with that ID.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example: { code: NOT_FOUND, message: "We couldn't find that restaurant.", field_errors: {} }
+    EntryNotFound:
+      description: No waitlist entry with that token.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: NOT_FOUND
+            message: We couldn't find that waitlist spot. Check your link and try again.
+            field_errors: {}
+    EntryClosed:
+      description: The entry is already SEATED, CANCELED or NO_SHOW.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: ENTRY_CLOSED
+            message: This party has already been seated, canceled, or marked as a no-show.
+            field_errors: {}
+    UsernameTaken:
+      description: Another user already has that username.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: CONFLICT
+            message: That username is already taken.
+            field_errors: { username: That username is already taken. }
+    ValidationError:
+      description: The request was rejected. `field_errors` names each bad field.
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+          example:
+            code: VALIDATION
+            message: Please fix the highlighted fields.
+            field_errors: { party_size: Party size must be a whole number from 1 to 20. }
+
+  schemas:
+    # ---- enums ----------------------------------------------------------
+
+    UserRole:
+      type: string
+      enum: [ADMIN, RESTAURANT]
+
+    WaitlistStatus:
+      type: string
+      enum: [WAITING, NOTIFIED, SEATED, CANCELED, NO_SHOW]
+      description: |
+        `WAITING` and `NOTIFIED` are active and hold a queue position.
+        `SEATED`, `CANCELED` and `NO_SHOW` are final.
+
+    WaitlistSource:
+      type: string
+      enum: [ONLINE, STAFF]
+      description: '`ONLINE` for eater joins, `STAFF` for walk-ins.'
+
+    # ---- shared field rules -------------------------------------------
+
+    PhoneNumber:
+      type: string
+      pattern: '^\s*\+?[\d\s().-]+\s*$'
+      description: |
+        Basic format check only. An optional leading `+`, then digits with
+        spaces, dots, dashes or parentheses, containing **7 to 15 digits** in
+        total. The digit count cannot be expressed as a pattern here, so the
+        server must count the digits itself. Stored trimmed.
+      examples: ['555-010-6677', '(555) 201-4455', '+44 20 7946 0958']
+
+    # ---- auth -----------------------------------------------------------
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username:
+          type: string
+          minLength: 1
+          description: Matched after trimming and lowercasing.
+        password:
+          type: string
+          description: Required by the form, but its contents are ignored. May be empty.
+
+    SessionUser:
+      type: object
+      required: [id, username, role, restaurant_id]
+      properties:
+        id: { type: integer }
+        username: { type: string }
+        role: { $ref: '#/components/schemas/UserRole' }
+        restaurant_id:
+          type: [integer, 'null']
+          description: The restaurant a `RESTAURANT` user operates. `null` for `ADMIN`.
+
+    LoginResult:
+      type: object
+      required: [token, user]
+      properties:
+        token:
+          type: string
+          description: 'Opaque. Send it back as `Authorization: Bearer <token>`.'
+        user: { $ref: '#/components/schemas/SessionUser' }
+
+    # ---- restaurants ----------------------------------------------------
+
+    PublicRestaurant:
+      type: object
+      required:
+        - id
+        - name
+        - address
+        - phone
+        - description
+        - current_wait_minutes
+        - is_active
+        - online_waitlist_enabled
+        - waiting_parties
+      properties:
+        id: { type: integer }
+        name: { type: string }
+        address: { type: string }
+        phone: { type: string }
+        description:
+          type: string
+          description: May be an empty string.
+        current_wait_minutes:
+          type: integer
+          minimum: 0
+          maximum: 240
+          description: The wait quoted to anyone who joins now.
+        is_active: { type: boolean }
+        online_waitlist_enabled:
+          type: boolean
+          description: False while staff have paused online joining.
+        waiting_parties:
+          type: integer
+          minimum: 0
+          description: Count of `WAITING` plus `NOTIFIED` entries, after the no-show sweep.
+      example:
+        id: 1
+        name: Bluebird Cafe
+        address: 123 Main Street
+        phone: (555) 201-4455
+        description: All-day breakfast, strong coffee, and a sunny patio.
+        current_wait_minutes: 30
+        is_active: true
+        online_waitlist_enabled: true
+        waiting_parties: 4
+
+    AdminRestaurant:
+      description: A restaurant with its settings and login username. Never includes the password.
+      allOf:
+        - $ref: '#/components/schemas/PublicRestaurant'
+        - type: object
+          required: [no_show_minutes, username, created_at, updated_at]
+          properties:
+            no_show_minutes:
+              type: integer
+              minimum: 1
+              maximum: 120
+            username:
+              type: string
+              description: The restaurant's login username.
+            created_at: { type: string, format: date-time }
+            updated_at: { type: string, format: date-time }
+
+    RestaurantRequest:
+      type: object
+      description: |
+        Body of both create (`POST`) and edit (`PUT`). The server trims every
+        string, and lowercases `username` before validating it.
+      required:
+        - name
+        - address
+        - phone
+        - description
+        - current_wait_minutes
+        - no_show_minutes
+        - is_active
+        - username
+        - password
+      properties:
+        name:
+          type: string
+          minLength: 1
+          description: Required; must not be blank after trimming.
+        address:
+          type: string
+          minLength: 1
+          description: Required; must not be blank after trimming.
+        phone: { $ref: '#/components/schemas/PhoneNumber' }
+        description:
+          type: string
+          maxLength: 500
+          description: May be empty.
+        current_wait_minutes:
+          type: integer
+          minimum: 0
+          maximum: 240
+          default: 30
+        no_show_minutes:
+          type: integer
+          minimum: 1
+          maximum: 120
+          default: 10
+        is_active:
+          type: boolean
+          default: true
+        username:
+          type: string
+          minLength: 1
+          pattern: '^\s*[A-Za-z0-9_-]+\s*$'
+          description: |
+            Stored trimmed and lowercased; after that it must match
+            `^[a-z0-9_-]+$` and be unique across all users (else `409 CONFLICT`).
+        password:
+          type: string
+          description: |
+            Stored as given, with no hashing (spec §5), and never checked at
+            login. May be empty. On `PUT`, an empty string keeps the existing
+            password.
+
+    RestaurantSettingsRequest:
+      type: object
+      description: Partial update. Omitted fields are unchanged. The frontend sends exactly one field per call.
+      properties:
+        current_wait_minutes:
+          type: integer
+          minimum: 0
+          maximum: 240
+        online_waitlist_enabled:
+          type: boolean
+
+    RestaurantStatusRequest:
+      type: object
+      required: [is_active]
+      properties:
+        is_active: { type: boolean }
+
+    # ---- waitlist -------------------------------------------------------
+
+    JoinWaitlistRequest:
+      type: object
+      description: |
+        Body of an online join and of a staff walk-in. The server trims every
+        string. The frontend always sends all four fields, with `notes` as an
+        empty string when left blank.
+      required: [guest_name, mobile_phone, party_size]
+      properties:
+        guest_name:
+          type: string
+          minLength: 1
+          description: Required; must not be blank after trimming.
+        mobile_phone: { $ref: '#/components/schemas/PhoneNumber' }
+        party_size:
+          type: integer
+          minimum: 1
+          maximum: 20
+        notes:
+          type: string
+          maxLength: 250
+          default: ''
+          description: Optional. Blank notes are stored as `null`.
+
+    UpdateWaitlistEntryRequest:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          enum: [NOTIFIED, SEATED, CANCELED, NO_SHOW]
+          description: The target status. `WAITING` is never a valid target.
+
+    EaterWaitlistView:
+      type: object
+      description: |
+        What an eater may see about their own entry. It deliberately leaves out
+        the entry ID, phone number, notes and other parties' details.
+      required:
+        - public_token
+        - restaurant_id
+        - restaurant_name
+        - guest_name
+        - party_size
+        - status
+        - quoted_wait_minutes
+        - joined_at
+        - estimated_ready_at
+        - notified_at
+        - position
+      properties:
+        public_token: { type: string }
+        restaurant_id: { type: integer }
+        restaurant_name: { type: string }
+        guest_name: { type: string }
+        party_size: { type: integer, minimum: 1, maximum: 20 }
+        status: { $ref: '#/components/schemas/WaitlistStatus' }
+        quoted_wait_minutes:
+          type: integer
+          minimum: 0
+          description: Frozen at join time.
+        joined_at: { type: string, format: date-time }
+        estimated_ready_at:
+          type: string
+          format: date-time
+          description: |
+            `joined_at + quoted_wait_minutes`. The frontend counts the
+            remaining wait down locally from this, and shows "Ready soon" at
+            or after it.
+        notified_at: { type: [string, 'null'], format: date-time }
+        position:
+          type: [integer, 'null']
+          minimum: 1
+          description: 1-based queue position while active; `null` once finished.
+      example:
+        public_token: 3f6c1d2e-9a41-4b7e-8c55-0d2f7a9b1e64
+        restaurant_id: 1
+        restaurant_name: Bluebird Cafe
+        guest_name: Marcos
+        party_size: 4
+        status: WAITING
+        quoted_wait_minutes: 30
+        joined_at: '2026-09-14T18:00:00.000Z'
+        estimated_ready_at: '2026-09-14T18:30:00.000Z'
+        notified_at: null
+        position: 5
+
+    StaffWaitlistEntry:
+      type: object
+      description: A waitlist entry as restaurant staff see it.
+      required:
+        - id
+        - public_token
+        - guest_name
+        - mobile_phone
+        - party_size
+        - notes
+        - source
+        - status
+        - quoted_wait_minutes
+        - joined_at
+        - estimated_ready_at
+        - notified_at
+        - seated_at
+        - canceled_at
+        - no_show_at
+        - position
+      properties:
+        id: { type: integer }
+        public_token: { type: string }
+        guest_name: { type: string }
+        mobile_phone: { type: string }
+        party_size: { type: integer, minimum: 1, maximum: 20 }
+        notes: { type: [string, 'null'] }
+        source: { $ref: '#/components/schemas/WaitlistSource' }
+        status: { $ref: '#/components/schemas/WaitlistStatus' }
+        quoted_wait_minutes: { type: integer, minimum: 0 }
+        joined_at: { type: string, format: date-time }
+        estimated_ready_at: { type: string, format: date-time }
+        notified_at:
+          type: [string, 'null']
+          format: date-time
+          description: The dashboard shows "Notified N min ago" from this.
+        seated_at: { type: [string, 'null'], format: date-time }
+        canceled_at: { type: [string, 'null'], format: date-time }
+        no_show_at: { type: [string, 'null'], format: date-time }
+        position:
+          type: [integer, 'null']
+          minimum: 1
+          description: 1-based queue position while active; `null` once finished.
+      example:
+        id: 7
+        public_token: demo-james
+        guest_name: James
+        mobile_phone: 555-010-4455
+        party_size: 4
+        notes: High chair please
+        source: ONLINE
+        status: NOTIFIED
+        quoted_wait_minutes: 30
+        joined_at: '2026-09-14T17:36:00.000Z'
+        estimated_ready_at: '2026-09-14T18:06:00.000Z'
+        notified_at: '2026-09-14T18:00:00.000Z'
+        seated_at: null
+        canceled_at: null
+        no_show_at: null
+        position: 2
+
+    RestaurantWaitlist:
+      type: object
+      required: [restaurant, active, history]
+      properties:
+        restaurant: { $ref: '#/components/schemas/AdminRestaurant' }
+        active:
+          type: array
+          description: '`WAITING` and `NOTIFIED` entries, ordered by `joined_at` then `id`.'
+          items: { $ref: '#/components/schemas/StaffWaitlistEntry' }
+        history:
+          type: array
+          description: Today's `SEATED`, `CANCELED` and `NO_SHOW` entries, most recently finished first.
+          items: { $ref: '#/components/schemas/StaffWaitlistEntry' }
+
+    # ---- errors ---------------------------------------------------------
+
+    Error:
+      type: object
+      required: [code, message, field_errors]
+      properties:
+        code:
+          type: string
+          enum: [UNAUTHORIZED, FORBIDDEN, NOT_FOUND, WAITLIST_CLOSED, ENTRY_CLOSED, CONFLICT, VALIDATION]
+        message:
+          type: string
+          description: Shown to the user verbatim. Friendly, with no internals.
+        field_errors:
+          type: object
+          additionalProperties: { type: string }
+          description: Request field name → message. An empty object when the error is not about a field.
