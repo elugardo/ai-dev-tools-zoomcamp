@@ -239,54 +239,241 @@ restaurant's password revokes its tokens.
 
 Needs Node 20.19+ or 22.12+, Python 3.13, and uv.
 
-### Usage
+### Getting started
+
+#### 1. Install the prerequisites
+
+| Tool | Version | Check | If it's missing |
+|---|---|---|---|
+| Node.js | 20.19+ or 22.12+ | `node --version` | [nodejs.org](https://nodejs.org/) or nvm |
+| uv | any recent | `uv --version` | `winget install astral-sh.uv` (Windows) or `curl -LsSf https://astral.sh/uv/install.sh \| sh` |
+| Python | 3.13 | `uv python list` | Nothing to do: `uv` downloads 3.13 on first `uv sync` if needed |
+| GNU make | optional | `make --version` | `winget install ezwinports.make` (Windows; open a new terminal afterwards). macOS and Linux usually have it |
+
+`make` is only a shortcut. Every `make` target below has an `npm run`
+equivalent, so you can skip it.
+
+#### 2. Get the code and install dependencies
 
 ```
+git clone https://github.com/elugardo/ai-dev-tools-zoomcamp.git
 cd ai-dev-tools-zoomcamp/module2
-npm run setup          # frontend (npm) and backend (uv) dependencies
-
-npm run dev:backend    # terminal 1: API on http://localhost:9127 (docs at /docs)
-npm run dev            # terminal 2: app on http://localhost:3417
+make install           # or: npm run setup
 ```
 
-To run the UI with no backend at all, use `npm run dev:mock` instead of the two
-commands above.
+This installs the frontend packages with npm and the backend packages with uv.
+Run it again whenever you pull changes that touch `package.json` or
+`pyproject.toml`.
 
-If you have GNU make, `module2/Makefile` wraps the same commands. `make install`
-installs dependencies, and `make dev` starts the backend and frontend together
-in one terminal; Ctrl+C stops both. `make mock` runs the frontend on the mock,
-`make test` runs every test, and `make db-reset` rebuilds the database with fresh
-demo data. `make` on its own lists all targets.
+#### 3. Start the app
 
-Demo accounts come from the seed data. All of them use the password `password`:
+With make, one terminal runs both servers, and Ctrl+C stops both:
 
-| Username | Role | Lands on |
+```
+make dev
+```
+
+Without make, use two terminals, both in `module2/`:
+
+```
+npm run dev:backend    # terminal 1: the API
+npm run dev            # terminal 2: the web app
+```
+
+The first backend start creates the database (`module2/backend/waitwise.db`)
+and loads the demo data. Then open:
+
+| What | URL |
+|---|---|
+| The app | http://localhost:3417 |
+| Interactive API docs (Swagger) | http://localhost:9127/docs |
+| The API itself | http://localhost:9127/api |
+
+To look at the UI with no backend at all, run `make mock` (or
+`npm run dev:mock`) instead. The app then runs on an in-browser copy of the API,
+stored in your browser. **Reset demo data** in the page footer rebuilds that
+copy.
+
+#### 4. Log in
+
+Every demo account uses the password `password`:
+
+| Username | Who | Lands on |
 |---|---|---|
-| `admin` | Admin | `/admin` |
-| `bluebird` | Bluebird Cafe staff | `/restaurant/dashboard` |
-| `oakember` | Oak & Ember staff | `/restaurant/dashboard` |
+| `admin` | WaitWise administrator | Restaurants list (`/admin`) |
+| `bluebird` | Staff at Bluebird Cafe | Bluebird's dashboard (`/restaurant/dashboard`) |
+| `oakember` | Staff at Oak & Ember | Oak & Ember's dashboard |
 
-A quick demo of the core scenario:
+Eaters never log in. Use **Staff login** in the top-right corner for these
+accounts.
 
-1. Open `http://localhost:3417`, pick **Bluebird Cafe**, and join as a party of 4.
-   You land on your status page with your position and remaining wait.
-2. In a second tab, log in as `bluebird` / `password`. Your party is at the
-   bottom of the queue.
-3. Click **Notify** on your party. Within 10 seconds the first tab shows
-   **Your table is ready!** without a refresh.
+### Using WaitWise
+
+**Try the whole flow in two minutes.** Use two browser windows, or one normal
+window and one private window, so each keeps its own login.
+
+1. In window A, open http://localhost:3417, choose **Bluebird Cafe**, and join
+   as a party of 4. You land on your personal status page.
+2. In window B, log in as `bluebird` / `password`. Your party is at the bottom of
+   **Active waitlist**.
+3. In window B, click **Notify** on your party. Within 10 seconds window A shows
+   **Your table is ready!**, with no refresh.
 4. Click **Seat**. The party moves to **Today's History**.
 
-Seeded eater pages have readable links, such as
-`http://localhost:3417/wait/demo-sarah`.
+#### As an eater (no account)
 
-The backend stores everything in `module2/backend/waitwise.db`, so data and
-logins survive restarts. Demo data loads only into an empty database, and its
-timestamps are fixed at that moment. For a fresh demo queue, run `make db-reset`
-(or `uv run python -m app.manage reset-db` from `backend/`). That deletes all
-data.
+- **Find a restaurant.** The home page lists every active restaurant with its
+  current wait. **View Waitlist** opens its page.
+- **Join.** Enter your name, mobile number and party size (1–20), plus optional
+  notes, then click **Join Waitlist**.
+  - The button is disabled if the restaurant has paused online joining, in which
+    case the page says "Online waitlist currently unavailable".
+- **Your status page** (`/wait/<token>`) is your ticket, so **bookmark it**.
+  - It shows your place in line and the estimated remaining wait. That estimate
+    counts down live and never goes below "Ready soon".
+  - The page checks for updates every 10 seconds, and it switches to **Your
+    table is ready!** when the restaurant notifies you.
+- **Leave.** **Leave Waitlist**, then **Yes, leave**, gives up your spot.
 
-To use a different database, set `WAITWISE_DATABASE_URL` to any SQLAlchemy URL
-before starting the backend, for example `sqlite:///C:/data/waitwise.db`.
+The quoted wait is fixed when you join. If the restaurant later changes its
+wait, your estimate does not move.
+
+#### As restaurant staff
+
+The dashboard refreshes itself every 10 seconds.
+
+- **The header** shows the current wait, the number of parties waiting, and
+  whether online joining is open.
+  - **Change Wait** sets the wait quoted to new guests only; parties already in
+    line keep their quote.
+  - **Add Walk-In** adds someone at the door. Walk-ins are allowed even while
+    online joining is paused.
+  - **Accepting Online Waitlist** pauses or resumes joining from the website.
+- **Active waitlist** lists parties in the order they joined. You can act on any
+  party, not just the first:
+  - **Notify** tells the guest their table is ready. The row then shows
+    "Notified N min ago".
+  - **Seat**, **Cancel** or **No Show** finish the party and move it to
+    **Today's History**.
+  - A notified party who doesn't arrive becomes a **No Show** automatically once
+    the restaurant's no-show timeout passes (10 minutes by default).
+- **Today's History** lists everyone seated, canceled or marked no-show today.
+
+#### As an admin
+
+- **Restaurants** lists every restaurant, including inactive ones, with its
+  login username.
+- **Add Restaurant** creates a restaurant and its staff login. The new login's
+  password needs at least 8 characters. New restaurants start with a 30-minute
+  wait, a 10-minute no-show timeout, and active status.
+- **Edit** changes details and the login. Leave the password blank to keep the
+  current one. Setting a new password signs that restaurant's staff out
+  everywhere.
+- **Deactivate** hides a restaurant from the public list and stops online
+  joining; its staff can still use their dashboard. **Activate** reverses it.
+
+#### Handy demo links
+
+The demo data includes guests whose status pages have readable links:
+http://localhost:3417/wait/demo-sarah and `/wait/demo-james` (waiting), and
+`/wait/demo-chen` (already seated). Open one next to the Bluebird dashboard and
+click **Notify** to watch the status page change.
+
+### Commands
+
+Run these from `module2/`.
+
+| make | npm equivalent | What it does |
+|---|---|---|
+| `make` | | List all targets |
+| `make install` | `npm run setup` | Install frontend and backend dependencies |
+| `make dev` | both commands below, in two terminals | Run the backend and the frontend together |
+| `make backend` | `npm run dev:backend` | Run only the API on port 9127, reloading when code changes |
+| `make frontend` | `npm run dev` | Run only the web app on port 3417 |
+| `make mock` | `npm run dev:mock` | Run the web app on the in-browser mock, no backend |
+| `make test` | `npm run test:all` | Run all frontend and backend tests |
+| `make test-frontend` / `make test-backend` | `npm run test:frontend` / `npm run test:backend` | Run one side's tests |
+| `make build` | `npm run build` | Typecheck and build the frontend for production |
+| `make db-init` | `uv --directory backend run python -m app.manage init-db` | Create any missing database tables |
+| `make db-reset` | `uv --directory backend run python -m app.manage reset-db` | **Delete all data**, recreate the tables and reload the demo data |
+
+### Configuration
+
+Everything has a working default. Set these only to change behavior.
+
+**Backend.** Set these in the shell before `make backend` or `make dev`:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `WAITWISE_DATABASE_URL` | `sqlite:///<module2>/backend/waitwise.db` | Which database to use; any SQLAlchemy URL |
+| `WAITWISE_SEED_DEMO_DATA` | `true` | Load the demo data into an **empty** database |
+| `WAITWISE_TOKEN_TTL_MINUTES` | `720` (12 hours) | How long a login lasts |
+| `WAITWISE_CORS_ORIGINS` | `http://localhost:3417,http://127.0.0.1:3417` | Browser origins allowed to call the API |
+
+```
+# PowerShell
+$env:WAITWISE_DATABASE_URL = "sqlite:///C:/data/waitwise.db"; make backend
+
+# macOS / Linux / Git Bash (note the four slashes for an absolute path)
+WAITWISE_DATABASE_URL=sqlite:////home/me/waitwise.db make backend
+```
+
+**Frontend.** Copy `module2/frontend/.env.example` to
+`module2/frontend/.env.local` and edit it:
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `VITE_API_BASE_URL` | `http://localhost:9127/api` | Where the web app sends API requests |
+| `VITE_SERVICE_MODE` | `http` | `http` uses the backend; `mock` uses the in-browser mock |
+
+If you move the frontend to a different address, add that address to
+`WAITWISE_CORS_ORIGINS`, or the browser will block its requests.
+
+### The database
+
+- **Where data lives.** By default, everything (restaurants, logins, waitlists
+  and sessions) is in the SQLite file `module2/backend/waitwise.db`. It is
+  ignored by git. Stopping or restarting the backend keeps all data, and
+  logged-in users stay logged in.
+- **Demo data** is added only when the database is empty, so it is never
+  duplicated. Its times are fixed when it's added, so after a while the demo
+  queue looks hours old. Run `make db-reset` for a fresh one. That deletes
+  everything else in the database too.
+- **Starting over.** Run `make db-reset`, or stop the backend and delete
+  `waitwise.db`; it is recreated on the next start.
+- **A throwaway database** that vanishes when the backend stops:
+  `WAITWISE_DATABASE_URL=sqlite://`.
+- **Other databases.** The backend is database-agnostic. For PostgreSQL, install
+  a driver (`uv --directory backend add "psycopg[binary]"`) and set a URL like
+  `postgresql+psycopg://user:password@localhost/waitwise`. Postgres support
+  hasn't been tested against a live server yet; see
+  [`module2/_docs/progress.md`](module2/_docs/progress.md).
+- **There are no migrations yet.** Tables are created at startup, but existing
+  tables are never altered. If a code change modifies a table, run
+  `make db-reset`.
+
+### Troubleshooting
+
+| Symptom | Cause and fix |
+|---|---|
+| The app says **"We can't reach WaitWise right now."** | The backend isn't running, or `VITE_API_BASE_URL` points elsewhere. Start it with `make backend` and check that http://localhost:9127/docs loads. If the backend is running, check its terminal for an error. |
+| `Port 3417 is already in use`, or the backend fails to bind port 9127 | A previous run is still going. Stop it with Ctrl+C in its terminal, or find the process. PowerShell: `Get-NetTCPConnection -LocalPort 3417 -State Listen \| Select OwningProcess`, then `Stop-Process -Id <id>`. macOS/Linux: `lsof -ti:3417 \| xargs kill` |
+| `The requested module 'node:util' does not provide an export named 'styleText'` | Node is too old. Install Node 20.19+ or 22.12+ and check `node --version` in the same terminal. |
+| `make: command not found` right after installing make | Open a new terminal so it picks up the updated `PATH`. |
+| **"Incorrect username or password."** for a demo account | The password is `password`. If an admin changed it, run `make db-reset` to restore the demo accounts. |
+| **"Your session has expired. Please log in again."** | Logins last 12 hours, and changing a restaurant's password signs its staff out. `make db-reset` also clears every session. Log in again. |
+| The demo parties have been "waiting" for hours or days | The demo data's times were fixed when it was loaded. Run `make db-reset`. |
+| A restaurant's page says **"Online waitlist currently unavailable"** | Its staff turned off **Accepting Online Waitlist**, or an admin deactivated it. |
+| After pulling code, pages fail to load, and the **backend terminal** shows `no such column` or `no such table` | The table layout changed and there are no migrations. Run `make db-reset`. |
+| `database is locked` | Another program (such as a SQLite browser) has `waitwise.db` open for writing. Close it. |
+
+**Trying the API directly.** Open http://localhost:9127/docs:
+
+1. Call `POST /api/auth/login` with `{"username": "bluebird", "password": "password"}`.
+2. Copy the `token` from the response.
+3. Click **Authorize** and paste it in.
+
+The restaurant and admin endpoints then work from the same page.
 
 ### Layout
 
@@ -302,6 +489,7 @@ module2/
 │       ├── components/ shared UI
 │       ├── auth/ hooks/ test/
 │       └── styles.css
+│   └── .env.example    frontend settings: API URL, http or mock mode
 ├── backend/
 │   ├── app/
 │   │   ├── main.py       app factory: database setup, CORS, error handlers, routers under /api
@@ -315,7 +503,8 @@ module2/
 │   │   └── seed.py, manage.py, config.py, errors.py, serializers.py
 │   ├── tests/
 │   └── pyproject.toml, uv.lock
-├── package.json    scripts: setup, dev, dev:backend, dev:mock, build, test:all
+├── Makefile        make install / dev / test / db-reset ... (run `make` for the list)
+├── package.json    the same commands as npm scripts
 ├── AGENTS.md       commands and rules for coding agents
 └── CLAUDE.md       points to AGENTS.md
 ```
