@@ -5,6 +5,9 @@ module 2. Admins manage restaurants, restaurant staff run their live waitlist,
 and eaters join a list and watch their place in line. The course spec is
 [`_docs/WaitWise_Restaurant_Waitlist_Manager_Specification.md`](_docs/WaitWise_Restaurant_Waitlist_Manager_Specification.md).
 The API contract is [`openapi.yaml`](openapi.yaml).
+[`_docs/progress.md`](_docs/progress.md) records what has shipped, the
+decisions behind it, and the open items. Read it before starting work, and add a
+dated entry at the end of each session.
 
 **Where the project stands:** Phases 2 and 3 of the spec (§3) are done.
 

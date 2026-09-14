@@ -283,7 +283,7 @@ seed and signs everyone out.
 
 ```
 module2/
-├── _docs/          the WaitWise specification
+├── _docs/          the WaitWise specification, and progress.md: what shipped, decisions, open items
 ├── openapi.yaml    the API contract both halves are tested against
 ├── frontend/
 │   └── src/
