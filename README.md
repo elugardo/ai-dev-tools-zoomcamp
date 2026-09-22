@@ -7,6 +7,7 @@ in its own numbered folder.
 |---|---|---|
 | [Module 1](#module-1--city-journal) | City Journal: a personal place-journal CLI | Python, Django, SQLite |
 | [Module 2](#module-2--waitwise) | WaitWise: a restaurant waitlist manager | React, TypeScript, Vite, FastAPI |
+| [Module 3](#module-3--agent-relay) | Agent Relay: containerize and deploy a task relay for agents | FastAPI, PostgreSQL, Docker, Compose, Kubernetes (kind), GitHub Actions (act) |
 
 ## Module 1 — City Journal
 
@@ -173,7 +174,7 @@ module1/
 | [`module1/_docs/tasks.md`](module1/_docs/tasks.md) | The ten-task backlog, mirrored as issues [#1–#10](https://github.com/elugardo/ai-dev-tools-zoomcamp/issues) |
 | [`module1/_docs/process.md`](module1/_docs/process.md) | How work is picked up, branched, committed, and closed |
 | [`module1/_docs/testing-guidelines.md`](module1/_docs/testing-guidelines.md) | Testing conventions |
-| [`AGENTS.md`](AGENTS.md) | Commands and rules for coding agents working in module 1 (module 2 has [its own](module2/AGENTS.md)) |
+| [`AGENTS.md`](AGENTS.md) | Commands and rules for coding agents working in module 1 (module 2 and module 3 have [their](module2/AGENTS.md) [own](module3/AGENTS.md)) |
 
 ### Status
 
@@ -560,3 +561,96 @@ confirming a test failed.
    suite.
 
 The course homework and FAQ URLs will be added once they are published.
+
+## Module 3 — Agent Relay
+
+[Homework 3](https://github.com/DataTalksClub/ai-dev-tools-zoomcamp/blob/main/cohorts/2026/homework/03-deployment/homework.md)
+is about deployment, not features. The app is
+[Agent Relay](https://github.com/alexeygrigorev/agent-relay), a small
+messaging system for software agents: one agent sends a task, a worker claims
+it through the HTTP API, and the worker reports the result. The database
+stores the tasks and every delivery attempt, and a dashboard shows the
+lifecycle. The protocol is in [`module3/SPEC.md`](module3/SPEC.md).
+
+The homework goes in six steps, and each is done and verified:
+
+| Step | What was done | Where |
+|---|---|---|
+| 1. Understand the project | Ran the starter, traced a task by hand | |
+| 2. Integration test | Two agents exchange a task and its result over real HTTP against the real DB | [`test_integration.py`](module3/test_integration.py) |
+| 3. Containerize | Image `agent-relay:local`, uvicorn on `0.0.0.0`, health check on `/ready`, non-root | [`Dockerfile`](module3/Dockerfile) |
+| 4. Compose + PostgreSQL | The app runs on PostgreSQL; `api` + `postgres` services | [`compose.yaml`](module3/compose.yaml), [`database.py`](module3/database.py), [`storage.py`](module3/storage.py) |
+| 5. Kubernetes | Manifests for kind: Deployment, StatefulSet with a PVC, Services, probes | [`k8s/`](module3/k8s/) |
+| 6. CI/CD | Tests on PostgreSQL, then a uniquely tagged image is built and rolled out to kind, only if tests pass; run locally with act | [`.github/workflows/ci.yml`](.github/workflows/ci.yml) |
+
+### Running it
+
+Everything runs from `module3/` and needs [uv](https://docs.astral.sh/uv/),
+Docker Desktop, and for steps 5 and 6 `kind`, `kubectl` and `act`.
+
+| Goal | Commands |
+|---|---|
+| Locally on SQLite | `uv sync` then `uv run uvicorn main:app --reload`; dashboard at http://127.0.0.1:8000/ |
+| Run the tests | `uv run pytest -q` (the integration test skips itself when no server is running) |
+| The integration test against any running relay | `$env:RELAY_BASE_URL = "http://127.0.0.1:8080"; uv run pytest -q test_integration.py` |
+| One container on SQLite | `docker build -t agent-relay:local .` then `docker run -d --name agent-relay -p 8080:8000 -v agent-relay-data:/data agent-relay:local` |
+| API + PostgreSQL with Compose | `docker compose up --build -d`; API on http://127.0.0.1:8080, PostgreSQL on 5432 |
+| Kubernetes on kind | `kind create cluster --name agent-relay`, `kind load docker-image agent-relay:local --name agent-relay`, `kubectl apply -k k8s/`, then `kubectl -n agent-relay port-forward svc/agent-relay 8080:8000` |
+| The CI workflow, locally | From the repo root: `act -W .github/workflows/ci.yml` (the Compose stack must be down first) |
+
+To try the task flow by hand, register two agents with
+`POST /api/v1/agents`, send a task as one, claim and complete it as the other,
+and read the result as the sender. Paste an agent's token into the dashboard to
+watch its tasks. The exact requests are in [`module3/README.md`](module3/README.md).
+
+### Where this differs from what the homework expects
+
+- **No GitHub fork.** The starter was copied into `module3/` (at upstream
+  commit `0a2895b`, without its git history) so it lives in this monorepo like
+  the other modules. The upstream README was kept and only its "no
+  PostgreSQL/Docker" paragraph replaced.
+- **The workflow lives at the repo root**, `.github/workflows/ci.yml`, because
+  that is where GitHub looks in a monorepo. It runs with
+  `working-directory: module3` and only on pushes that touch `module3/**`.
+- **Host port 8080, not 8000.** The container, the Compose stack and the kind
+  port-forward all publish on 8080, so they can run next to a dev server on
+  8000. Inside the container the API still listens on 8000.
+- **PostgreSQL was added, not swapped in.** SQLite stays the default and the
+  test suite still runs on it. `RELAY_DATABASE_URL` picks PostgreSQL. What
+  SQLite got from its `BEGIN IMMEDIATE` writer lock, PostgreSQL gets from row
+  locks: claims use `FOR UPDATE SKIP LOCKED`, and recovery, heartbeat and
+  completion lock the task first and then the attempt, so they cannot
+  deadlock. The starter's concurrent-claims test passes on PostgreSQL.
+- **The integration test is HTTP-only.** It never imports the app, so the same
+  test runs against the dev server, the container, Compose, kind and CI, just
+  by setting `RELAY_BASE_URL`. It only adds rows, so it is safe on a database
+  with data, and it skips when nothing is listening.
+- **Kubernetes details.** The manifests are a kustomization in an
+  `agent-relay` namespace. PostgreSQL is a StatefulSet with a 1Gi PVC (data
+  survives deleting the pod). The API runs two replicas, which the PostgreSQL
+  locking makes safe. The API gained a `startupProbe` and a
+  `RELAY_DB_WAIT_SECONDS` setting after the first deploy showed the API
+  crashing while PostgreSQL was still pulling its image.
+- **CI networking.** act runs each job on the Docker host's network, so the
+  workflow reaches the PostgreSQL service and the kind API server on
+  `localhost`, the same as a GitHub-hosted runner. Under act the deploy job
+  reuses the local `agent-relay` cluster; on GitHub it creates a throwaway
+  one. Each run builds `agent-relay:<short sha>-<timestamp>` and sets that tag
+  in the kustomization inside CI's copy of the repo, so the committed manifests
+  always say `local`.
+- **The dashboard heading is `Agent Relay v2`** in the repo: that is the
+  homework's final state, deployed through the workflow.
+- **Tools.** `kind` and `act` were installed as single binaries in `~/bin`, and
+  `~/.actrc` selects the `catthehacker/ubuntu:act-latest` runner image so act
+  never prompts.
+
+### Homework answers
+
+| Question | Answer |
+|---|---|
+| 1. Architecture | Agents claim tasks from a DB through an HTTP API |
+| 2. Status the sender sees after the result is submitted | `completed` |
+| 3. Docker option that publishes a port | `-p` |
+| 4. Hostname for the `postgres` service in Compose | `postgres` |
+| 5. Resource that keeps replicas running and manages updates | `Deployment` |
+| 6. If a test fails in the workflow | Keep the existing version running and stop the deployment |

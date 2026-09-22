@@ -125,6 +125,38 @@ kind delete cluster --name agent-relay          # tear everything down
   and `kustomize edit set image agent-relay=agent-relay:<tag>` in `k8s/`
   (what CI does in step 6).
 
+CI with act (step 6), from the **repo root**:
+
+```
+act -W .github/workflows/ci.yml                  # run the whole workflow locally
+act -W .github/workflows/ci.yml -j test          # one job
+```
+
+- The workflow is [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
+  at the repo root (it runs on pushes that touch `module3/**`). Job `test`
+  runs the starter suite and `test_integration.py` against a PostgreSQL
+  service container; job `deploy` **needs `test`**, so a failing test stops
+  before the build and the running version stays as it is.
+- `deploy` tags the image `agent-relay:<short sha>-<UTC timestamp>` so every
+  run is a new version, loads it into kind, sets `newTag` in
+  `k8s/kustomization.yaml` (in CI's copy of the repo, never in git), applies,
+  and waits for the rollout. If the rollout fails it runs `rollout undo`.
+- `act` is at `~/bin/act.exe` (v0.2.89). `~/.actrc` picks the runner image
+  `catthehacker/ubuntu:act-latest`, which is how the first run avoids an
+  interactive prompt. act copies the repo into the job container, so nothing
+  in the job touches the working tree or the Windows `.venv`.
+- **Networking under act.** act runs job containers on the Docker host's
+  network, with the Docker socket mounted. That is why the workflow uses
+  `localhost` for the PostgreSQL service and the plain kubeconfig
+  (`127.0.0.1:<port>`) for kind, and why it works unchanged on a GitHub-hosted
+  runner. Consequences: the Compose stack must be **down** (both publish
+  5432), and the deploy job reuses the local `agent-relay` cluster instead of
+  creating one.
+- Every run leaves another `agent-relay:<tag>` image on the kind node and in
+  Docker. `docker image prune` and recreating the cluster clean them up.
+- After a deploy, restart any `kubectl port-forward`: it was bound to a pod
+  that no longer exists.
+
 ## Architecture
 
 ```

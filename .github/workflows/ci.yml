@@ -1,0 +1,138 @@
+# Module 3 (Agent Relay): test against PostgreSQL, then build a uniquely
+# tagged image and deploy it to the kind cluster. `deploy` needs `test`, so a
+# failing test leaves the running version untouched.
+#
+# Runs locally with act from the repo root:
+#   act -W .github/workflows/ci.yml
+# act runs each job in a container on the Docker host's network with the
+# Docker socket mounted, so `docker build` and `kind load` talk to the same
+# daemon that runs the kind cluster, and published ports (the PostgreSQL
+# service, the kind API server) are reachable on localhost, just as on a
+# GitHub-hosted runner. On GitHub the deploy job creates a throwaway cluster.
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "module3/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+defaults:
+  run:
+    working-directory: module3
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        run: |
+          curl -LsSf https://astral.sh/uv/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      - name: Point at the PostgreSQL service
+        # Through its published port: the job runs on the host network under
+        # act and directly on the runner on GitHub.
+        run: |
+          echo "PG_URL=postgresql://relay:relay@localhost:5432/relay" >> "$GITHUB_ENV"
+          echo "RELAY_DATABASE_URL=postgresql+psycopg://relay:relay@localhost:5432/relay" >> "$GITHUB_ENV"
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in $(seq 1 30); do
+            uv run python -c "import os, psycopg; psycopg.connect(os.environ['PG_URL']).close()" && exit 0
+            sleep 2
+          done
+          echo "PostgreSQL did not become ready" >&2
+          exit 1
+
+      - name: Starter test suite on PostgreSQL
+        run: uv run pytest -q test_agent_relay.py
+
+      - name: Start the API
+        run: |
+          nohup uv run uvicorn main:app --host 127.0.0.1 --port 8000 > api.log 2>&1 &
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8000/ready && exit 0
+            sleep 1
+          done
+          echo "API did not become ready" >&2
+          cat api.log
+          exit 1
+
+      - name: Integration test against the API and PostgreSQL
+        env:
+          RELAY_BASE_URL: http://127.0.0.1:8000
+        run: uv run pytest -q test_integration.py
+
+      - name: API log
+        if: failure()
+        run: cat api.log || true
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      CLUSTER: agent-relay
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install kind and kubectl
+        run: |
+          curl -sSLo kind https://kind.sigs.k8s.io/dl/v0.33.0/kind-linux-amd64
+          curl -sSLo kubectl "https://dl.k8s.io/release/$(curl -sSL https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          sudo install -m 0755 kind kubectl /usr/local/bin/
+          rm kind kubectl
+          kind version && kubectl version --client
+
+      - name: Choose a unique image tag
+        run: echo "TAG=${GITHUB_SHA::7}-$(date -u +%Y%m%d%H%M%S)" >> "$GITHUB_ENV"
+
+      - name: Build the image
+        run: docker build -t "agent-relay:$TAG" .
+
+      - name: Connect to the kind cluster
+        run: |
+          if ! kind get clusters | grep -qx "$CLUSTER"; then
+            kind create cluster --name "$CLUSTER" --wait 120s
+          fi
+          # The kubeconfig points at the API server's published 127.0.0.1
+          # port, which the host-networked act container sees too.
+          kind export kubeconfig --name "$CLUSTER"
+          kubectl cluster-info
+
+      - name: Load the image into kind
+        run: kind load docker-image "agent-relay:$TAG" --name "$CLUSTER"
+
+      - name: Deploy
+        run: |
+          sed -i "s/^\( *newTag:\).*/\1 $TAG/" k8s/kustomization.yaml
+          kubectl apply -k k8s/
+          kubectl -n agent-relay rollout status deployment/agent-relay --timeout=180s
+          kubectl -n agent-relay get deployment agent-relay -o jsonpath='{"deployed image: "}{.spec.template.spec.containers[0].image}{"\n"}'
+          kubectl -n agent-relay get pods
+
+      - name: Roll back a failed rollout
+        if: failure()
+        run: kubectl -n agent-relay rollout undo deployment/agent-relay || true
