@@ -118,9 +118,17 @@ module3/
   table on whatever `RELAY_DATABASE_URL` points at. By default that is a
   scratch file at `/tmp/agent-relay-test.db` (on Windows, `C:\tmp\`). Never
   point it at a database you want to keep.
-- The starter tests use FastAPI's `TestClient`. The homework's integration test
-  (step 2) must call a running API over HTTP, so that it can target the local
-  server, the container, the Compose stack and the kind deployment. Make its
-  base URL configurable.
+- The starter tests in `test_agent_relay.py` use FastAPI's `TestClient`.
+- `test_integration.py` is the step 2 integration test. It covers SPEC
+  acceptance scenario 1 over real HTTP against a **running** server, so the same
+  test targets the local server, the container, the Compose stack and kind.
+  - Set `RELAY_BASE_URL` to point it elsewhere. The default is
+    `http://127.0.0.1:8000`.
+  - It skips when nothing answers, so a plain `uv run pytest` works without a
+    server.
+  - It only adds rows (fresh agents and one task per run), so it is safe
+    against a database you want to keep.
+  - To run only this test against the server at `RELAY_BASE_URL`, use
+    `uv run pytest -q test_integration.py`.
 - **Prove a new test can fail.** Break the line it defends, watch the test go
   red, then restore the line.
