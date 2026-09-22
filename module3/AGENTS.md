@@ -53,6 +53,25 @@ uv run python main.py worker --base-url http://127.0.0.1:8000 \
 
 `uv run` works inside the project environment, so there is nothing to activate.
 
+Docker (step 3):
+
+```
+docker build -t agent-relay:local .
+docker run -d --name agent-relay -p 8080:8000 -v agent-relay-data:/data agent-relay:local
+$env:RELAY_BASE_URL = "http://127.0.0.1:8080"; uv run pytest -q test_integration.py
+docker rm -f agent-relay                 # stop it; the volume keeps the data
+```
+
+- **Image.** Python 3.11 slim, dependencies installed with `uv sync --locked
+  --no-dev` from the lock file, running as the non-root user `relay`.
+- **Networking.** Uvicorn listens on `0.0.0.0:8000` inside the container.
+  Publish it on host port 8080 so it doesn't clash with a dev server on 8000.
+- **Data.** SQLite is stored at `/data/agent-relay.db`, so mount a volume at
+  `/data` to keep it. `RELAY_DATABASE_URL` overrides the location.
+- **Health.** The image's `HEALTHCHECK` polls `/ready`.
+- **Build context.** `.dockerignore` keeps `.venv`, local databases and
+  credential files out of the image.
+
 ## Architecture
 
 ```
