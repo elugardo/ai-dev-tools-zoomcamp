@@ -93,6 +93,38 @@ docker compose down                      # add -v to delete the database volume 
   `docker compose exec postgres psql -U relay -d relay -c "create database relay_test;"`
   then `$env:RELAY_DATABASE_URL = "postgresql+psycopg://relay:relay@127.0.0.1:5432/relay_test"; uv run pytest -q test_agent_relay.py`.
 
+Kubernetes with kind (step 5):
+
+```
+kind create cluster --name agent-relay          # once; kubectl context kind-agent-relay
+kind load docker-image agent-relay:local --name agent-relay
+kubectl apply -k k8s/
+kubectl -n agent-relay rollout status deployment/agent-relay
+kubectl -n agent-relay port-forward svc/agent-relay 8080:8000   # dashboard on http://127.0.0.1:8080
+$env:RELAY_BASE_URL = "http://127.0.0.1:8080"; uv run pytest -q test_integration.py
+kubectl -n agent-relay exec postgres-0 -- psql -U relay -d relay -c "select status, output from tasks;"
+kind delete cluster --name agent-relay          # tear everything down
+```
+
+- `kind` is a single binary at `~/bin/kind.exe` (v0.33); `kubectl` comes with
+  Docker Desktop.
+- `k8s/` is a kustomization, so `kubectl apply -k k8s/` applies everything in
+  the `agent-relay` namespace: a `postgres` Secret (dev credentials), a
+  PostgreSQL **StatefulSet** with a 1Gi PVC (`data-postgres-0`, which survives
+  pod deletion) and Service, and the API **Deployment** (2 replicas) and
+  Service. The API builds `RELAY_DATABASE_URL` from the Secret with `$(VAR)`
+  expansion, so the credentials live in one place.
+- **Probes.** The API has a `startupProbe` on `/health` (up to 150 s, because
+  the process blocks in `init_db()` until PostgreSQL answers, and
+  `RELAY_DB_WAIT_SECONDS=120` there), a readiness probe on `/ready` and a
+  liveness probe on `/health`. PostgreSQL uses `pg_isready`.
+- **Images are never pulled.** The Deployment uses `agent-relay:<tag>` with
+  `imagePullPolicy: IfNotPresent`; `kind load docker-image` puts it on the node.
+  Re-loading the same tag does **not** restart pods: either
+  `kubectl rollout restart deployment/agent-relay` or, better, use a new tag
+  and `kustomize edit set image agent-relay=agent-relay:<tag>` in `k8s/`
+  (what CI does in step 6).
+
 ## Architecture
 
 ```

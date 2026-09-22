@@ -1,0 +1,13 @@
+# kubectl apply -k k8s/
+# CI changes the image tag per version with:
+#   kustomize edit set image agent-relay=agent-relay:<tag>
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: agent-relay
+resources:
+  - namespace.yaml
+  - postgres.yaml
+  - api.yaml
+images:
+  - name: agent-relay
+    newTag: local

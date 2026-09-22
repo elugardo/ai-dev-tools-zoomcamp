@@ -40,6 +40,7 @@ LEASE_SECONDS = positive_int("RELAY_LEASE_SECONDS", 60)
 MAX_ATTEMPTS = positive_int("RELAY_MAX_ATTEMPTS", 5)
 RECOVERY_INTERVAL_SECONDS = max(1, positive_int("RELAY_RECOVERY_INTERVAL_SECONDS", 5))
 MAX_BODY_BYTES = positive_int("RELAY_MAX_BODY_BYTES", 256 * 1024)
+DB_WAIT_SECONDS = positive_int("RELAY_DB_WAIT_SECONDS", 30)
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
 
@@ -165,9 +166,11 @@ if IS_SQLITE:
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
-def init_db(wait_seconds: float = 30.0) -> None:
+def init_db(wait_seconds: float = DB_WAIT_SECONDS) -> None:
     """Create missing tables, waiting for a PostgreSQL server that is still
-    starting (Compose and Kubernetes start the API alongside the database)."""
+    starting (Compose and Kubernetes start the API alongside the database).
+    RELAY_DB_WAIT_SECONDS sets the limit; a first deploy that must pull the
+    PostgreSQL image needs more than the 30 s default."""
 
     deadline = time.monotonic() + wait_seconds
     while True:
