@@ -97,6 +97,17 @@ recreates all tables on whatever `RELAY_DATABASE_URL` points at, so stop
 the dev server first or set `RELAY_DATABASE_URL` to a scratch file before
 running tests against another database.
 
-This starter intentionally does not include Docker, Kubernetes, CI, external
-brokers, an LLM, or a PostgreSQL implementation. Those are deployment and
-student-port concerns rather than part of the local relay protocol.
+## PostgreSQL and Docker
+
+The same code runs on PostgreSQL: set `RELAY_DATABASE_URL` to a
+`postgresql+psycopg://user:password@host:5432/dbname` URL. On PostgreSQL the
+claim query uses `FOR UPDATE SKIP LOCKED` and recovery, heartbeat and
+completion take row locks (task first, then attempt) instead of SQLite's
+`BEGIN IMMEDIATE`. The HTTP protocol is unchanged.
+
+`docker compose up --build` starts the API on <http://127.0.0.1:8080> together
+with a `postgres` service (data in a named volume). The `Dockerfile` alone
+builds an image that runs on SQLite stored under `/data`.
+
+The starter does not include an external broker or an LLM: agents claim tasks
+from the database through the HTTP API.

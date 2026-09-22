@@ -1,20 +1,25 @@
-"""SQLite database setup and durable Agent Relay models.
+"""Database setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is intentionally the only place that knows about the database
+dialect.  SQLite (the default) relies on WAL and a ``BEGIN IMMEDIATE`` writer
+transaction to serialize claims.  PostgreSQL
+(``RELAY_DATABASE_URL=postgresql+psycopg://...``) uses ordinary transactions
+plus row locks (``FOR UPDATE [SKIP LOCKED]``), which the SQLite dialect
+compiles away.  The rest of the application talks to the models through
+:mod:`storage`.
 """
 
 from __future__ import annotations
 
 import os
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Any, Generator
 
 from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
 from sqlalchemy.engine import Engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
@@ -134,8 +139,10 @@ def _is_sqlite(url: str) -> bool:
     return url.startswith("sqlite")
 
 
+IS_SQLITE = _is_sqlite(DATABASE_URL)
+
 engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
-if _is_sqlite(DATABASE_URL):
+if IS_SQLITE:
     engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
     if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
         from sqlalchemy.pool import StaticPool
@@ -144,7 +151,7 @@ if _is_sqlite(DATABASE_URL):
 
 engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
 
-if _is_sqlite(DATABASE_URL):
+if IS_SQLITE:
 
     @event.listens_for(engine, "connect")
     def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
@@ -158,8 +165,19 @@ if _is_sqlite(DATABASE_URL):
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
-def init_db() -> None:
-    Base.metadata.create_all(engine)
+def init_db(wait_seconds: float = 30.0) -> None:
+    """Create missing tables, waiting for a PostgreSQL server that is still
+    starting (Compose and Kubernetes start the API alongside the database)."""
+
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        try:
+            Base.metadata.create_all(engine)
+            return
+        except OperationalError:
+            if IS_SQLITE or time.monotonic() >= deadline:
+                raise
+            time.sleep(1)
 
 
 @contextmanager
@@ -177,19 +195,23 @@ def db_session() -> Generator[Session, None, None]:
 
 @contextmanager
 def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
+    """Run one writer transaction before selecting or changing work.
 
     SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
     ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
     terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
+    lease.  On PostgreSQL this is an ordinary transaction: the row locks taken
+    by :func:`lock_task`, :func:`recover_expired_in_session` and the claim
+    query in :mod:`storage` do the coordinating instead.
     """
 
     connection = engine.connect()
     session = Session(bind=connection, expire_on_commit=False, autoflush=True)
     try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        if IS_SQLITE:
+            connection.exec_driver_sql("BEGIN IMMEDIATE")
+        else:
+            connection.begin()
         yield session
         session.flush()
         connection.commit()
@@ -201,21 +223,43 @@ def immediate_transaction() -> Generator[Session, None, None]:
         connection.close()
 
 
+def lock_task(db: Session, task_id: str) -> Task | None:
+    """Load a task and hold its row lock until the transaction ends.
+
+    Every writer that touches a task and its attempts locks the task first and
+    the attempt second, so PostgreSQL cannot deadlock.  The SQLite dialect
+    drops ``FOR UPDATE``; ``BEGIN IMMEDIATE`` already serializes writers there.
+    """
+
+    return db.scalar(
+        select(Task).where(Task.id == task_id).with_for_update().execution_options(populate_existing=True)
+    )
+
+
 def recover_expired_in_session(db: Session, now: datetime) -> int:
-    """Expire active leases and requeue/fail their tasks within ``db``."""
+    """Expire active leases and requeue/fail their tasks within ``db``.
+
+    The scan for expired attempts runs unlocked; each attempt is then
+    re-read under its task's lock, because a heartbeat or another recovery
+    pass may have changed it in between.
+    """
 
     now_db = as_db_time(now)
-    expired = list(
+    expired_ids = list(
         db.scalars(
-            select(Attempt)
+            select(Attempt.id)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
         )
     )
     count = 0
-    for attempt in expired:
-        task = db.get(Task, attempt.task_id)
-        if task is None or attempt.outcome != "processing":
+    for attempt_id in expired_ids:
+        attempt = db.get(Attempt, attempt_id)
+        if attempt is None:
+            continue
+        task = lock_task(db, attempt.task_id)
+        db.refresh(attempt, with_for_update=True)
+        if task is None or attempt.outcome != "processing" or attempt.lease_expires_at > now_db:
             continue
         attempt.outcome = "expired"
         attempt.finished_at = now_db
@@ -258,6 +302,7 @@ __all__ = [
     "immediate_transaction",
     "init_db",
     "iso_time",
+    "lock_task",
     "recover_expired",
     "recover_expired_in_session",
     "utcnow",

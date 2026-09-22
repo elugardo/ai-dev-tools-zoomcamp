@@ -72,6 +72,27 @@ docker rm -f agent-relay                 # stop it; the volume keeps the data
 - **Build context.** `.dockerignore` keeps `.venv`, local databases and
   credential files out of the image.
 
+Docker Compose with PostgreSQL (step 4):
+
+```
+docker compose up --build -d             # API on http://127.0.0.1:8080, PostgreSQL on 5432
+$env:RELAY_BASE_URL = "http://127.0.0.1:8080"; uv run pytest -q test_integration.py
+docker compose exec postgres psql -U relay -d relay -c "select status, output from tasks;"
+docker compose down                      # add -v to delete the database volume too
+```
+
+- The services are `postgres` (`postgres:17-alpine`, data in the `pgdata`
+  volume, `pg_isready` healthcheck) and `api` (built from the `Dockerfile`).
+  `api` waits for `postgres` to be healthy, and connects to it by its service
+  name: `postgresql+psycopg://relay:relay@postgres:5432/relay`.
+- The dev credentials (`relay`/`relay`/`relay`) are defaults in `compose.yaml`.
+  Override them with `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`,
+  `POSTGRES_PORT` and `API_PORT` in a gitignored `.env` file.
+- To run the **starter suite on PostgreSQL**, give it a database of its own,
+  because it drops every table:
+  `docker compose exec postgres psql -U relay -d relay -c "create database relay_test;"`
+  then `$env:RELAY_DATABASE_URL = "postgresql+psycopg://relay:relay@127.0.0.1:5432/relay_test"; uv run pytest -q test_agent_relay.py`.
+
 ## Architecture
 
 ```
@@ -99,10 +120,20 @@ module3/
   claim token. When `RELAY_ENROLLMENT_SECRET` is set, registration requires
   `X-Enrollment-Secret`.
 - **The storage seam.** `storage.py` and `database.py` hold all of the database
-  code. SQLite has no `FOR UPDATE SKIP LOCKED`, so the starter serializes writers
-  with `BEGIN IMMEDIATE`. The PostgreSQL port (step 4) belongs here, and the HTTP
-  protocol in `SPEC.md` must not change. The `psycopg[binary]` driver is already
-  a dependency.
+  code, and both SQLite and PostgreSQL work through the same ORM code. The
+  dialect only matters in `immediate_transaction()`:
+  - **SQLite** (the default) has no row locks, so every writer transaction
+    starts with `BEGIN IMMEDIATE`, which serializes writers across processes.
+    The SQLite dialect compiles the `FOR UPDATE` clauses below away.
+  - **PostgreSQL** uses ordinary transactions plus row locks. A claim selects
+    the oldest queued task `FOR UPDATE SKIP LOCKED`, so concurrent workers take
+    different tasks. Recovery, heartbeat and completion lock rows `FOR UPDATE`,
+    **always the task first and then the attempt** (`lock_task()`), which is
+    what rules out deadlocks. Keep that order in any new writer. The starter
+    suite's concurrent-claims test passes on PostgreSQL, so run it there after
+    touching this code.
+  - `init_db()` retries for 30 s on PostgreSQL, because Compose and Kubernetes
+    may start the API before the database accepts connections.
 
 ### Configuration
 
