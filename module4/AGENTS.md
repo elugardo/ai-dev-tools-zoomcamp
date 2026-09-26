@@ -54,6 +54,20 @@ module4/
 └── Dockerfile          python:3.12-slim, uv sync --frozen --no-dev
 ```
 
+- **Telemetry** is set up in `app/telemetry.py` (step 2), called once from
+  `main.py`. `OTEL_EXPORTER` selects `console` (default), `otlp`
+  (Collector at `OTEL_EXPORTER_OTLP_ENDPOINT`) or `none` (tests, via
+  `tests/conftest.py`). Signals: the FastAPI histogram
+  `http.server.request.duration` (attributes `http.route`,
+  `http.request.method`, `http.response.status_code`), the counter
+  `order.lookups` (route, status code, `outcome` = found / not_found /
+  error), one span per request plus an `order.lookup` span with the order id
+  and a `SELECT orders` span for its query, and every `logging` record with
+  trace and span ids. (sqlite3 auto-instrumentation does not work here: the
+  app uses `connection.execute()`, whose cursor is created in C.)
+  `/healthz` is excluded. The stable HTTP semantic conventions are opted in
+  (`OTEL_SEMCONV_STABILITY_OPT_IN=http`) before the instrumentation imports,
+  so keep the `os.environ.setdefault` at the top of `telemetry.py`.
 - **SQLite** at `ORDER_DB_PATH` (`/data/orders.db` in the container). Three
   orders are seeded into an empty database: `standard-1001`, `express-1002`
   and `standard-1003`. Only run one app container at a time.

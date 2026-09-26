@@ -1,3 +1,4 @@
+import logging
 import os
 import sqlite3
 from contextlib import asynccontextmanager
@@ -9,7 +10,10 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from app import telemetry
 
+
+LOGGER = logging.getLogger("order_tracker")
 DB_PATH = Path(os.getenv("ORDER_DB_PATH", "data/orders.db"))
 STATUSES = {"received", "preparing", "shipped", "delivered"}
 
@@ -77,6 +81,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="Order Tracker", lifespan=lifespan)
+telemetry.configure(app)
 
 
 @app.get("/")
@@ -98,13 +103,46 @@ def list_orders():
     return [as_dict(row) for row in rows]
 
 
-@app.get("/api/orders/{order_id}")
-def get_order(order_id: str):
-    with connect() as db:
+def load_order(order_id: str):
+    with connect() as db, telemetry.tracer.start_as_current_span("SELECT orders") as span:
+        span.set_attributes(
+            {"db.system.name": "sqlite", "db.operation.name": "SELECT", "db.collection.name": "orders"}
+        )
         row = db.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
     if row is None:
         raise HTTPException(404, "Order not found")
     return order_detail(row)
+
+
+@app.get("/api/orders/{order_id}")
+def get_order(order_id: str):
+    # The instrumented endpoint: a span with the order id, a counter by
+    # status code, and a log line (with the traceback on failure) that
+    # carries the trace id.
+    with telemetry.tracer.start_as_current_span("order.lookup") as span:
+        span.set_attribute("order.id", order_id)
+        try:
+            order = load_order(order_id)
+        except HTTPException as exc:
+            telemetry.record_lookup(exc.status_code, "not_found")
+            LOGGER.info(
+                "order lookup: not found",
+                extra={"order.id": order_id, "http.response.status_code": exc.status_code},
+            )
+            raise
+        except Exception:
+            telemetry.record_lookup(500, "error")
+            LOGGER.exception(
+                "order lookup failed",
+                extra={"order.id": order_id, "http.response.status_code": 500},
+            )
+            raise
+    telemetry.record_lookup(200, "found")
+    LOGGER.info(
+        "order lookup",
+        extra={"order.id": order_id, "http.response.status_code": 200, "order.priority": order["priority"]},
+    )
+    return order
 
 
 @app.post("/api/orders", status_code=201)
@@ -118,7 +156,7 @@ def create_order(order: NewOrder):
             (order_id, order.customer, order.item, order.priority, "received",
              datetime.now(timezone.utc).isoformat()),
         )
-    return get_order(order_id)
+    return load_order(order_id)
 
 
 @app.patch("/api/orders/{order_id}")
@@ -132,4 +170,4 @@ def update_status(order_id: str, update: StatusUpdate):
         )
     if cursor.rowcount == 0:
         raise HTTPException(404, "Order not found")
-    return get_order(order_id)
+    return load_order(order_id)

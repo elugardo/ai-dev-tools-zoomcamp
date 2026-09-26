@@ -8,6 +8,10 @@ services:
       - "127.0.0.1:${ORDER_TRACKER_PORT:-8000}:8000"
     environment:
       ORDER_DB_PATH: /data/orders.db
+      # Telemetry to stdout (see `docker compose logs app`); metrics every 10 s.
+      OTEL_EXPORTER: console
+      OTEL_SERVICE_NAME: order-tracker
+      OTEL_METRIC_EXPORT_INTERVAL: "10000"
     volumes:
       - orders:/data
     restart: unless-stopped
