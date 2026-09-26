@@ -75,6 +75,22 @@ curl -s http://localhost:3200/api/traces/<trace_id>
 - **Log fields in Loki:** everything but the two stream labels is structured
   metadata with dots turned into underscores: `trace_id`, `span_id`,
   `order_id`, `http_response_status_code`, `severity_text`.
+- **The alert** (step 4) is `grafana/provisioning/alerting/rules.yaml`, rule
+  uid `order-tracker-5xx`: per-route `increase()` of 5xx responses over 5 m,
+  evaluated every 10 s, Pending for 30 s, then Firing. Quiet periods are
+  Normal (`or vector(0)` + `noDataState: OK`). Its labels carry `endpoint`
+  and its annotations `summary`, `endpoint`, `window`, `dashboard`, `logs` and
+  `traces` (Explore links). Check its state with
+  `curl -s http://localhost:3000/api/prometheus/grafana/api/v1/rules`.
+  Gotchas: Grafana expands `$VAR` in rule **labels** (not annotations), so
+  the label template is written `$$labels` while annotations use `$labels`;
+  `__dashboardUid__` must come with `__panelId__`; a provisioning error is
+  fatal and Grafana exits.
+- **First-error visibility.** Prometheus runs with
+  `--enable-feature=created-timestamp-zero-ingestion` and the Collector's
+  exporter has `enable_open_metrics: true`, so `increase()` sees the very
+  first 5xx on a new series (verified: a new series shows `increase > 0` on
+  its first sample) instead of needing a second request.
 - **Versions are pinned** in `compose.yaml` (Collector 0.161, Prometheus
   v3.15, Loki 3.7, Tempo 3.0, Grafana 13.2). Tempo 3 has no `usage_report`
   block, and the Collector's exporter types are `otlp_http` / `otlp_grpc`

@@ -19,6 +19,10 @@ exporters:
     # (service_name, service_version), so dashboards can filter by them.
     resource_constant_labels:
       included: ["service.name", "service.version"]
+    # OpenMetrics carries each counter's created timestamp; with Prometheus's
+    # created-timestamp-zero-ingestion that makes increase() see the very
+    # first error on a new series instead of only the second.
+    enable_open_metrics: true
   otlp_http/loki:
     endpoint: http://loki:3100/otlp
   otlp_grpc/tempo:

@@ -43,6 +43,9 @@ services:
     command:
       - --config.file=/etc/prometheus/prometheus.yaml
       - --storage.tsdb.retention.time=7d
+      # Ingest a zero sample at each counter's created timestamp (from the
+      # Collector's OpenMetrics output), so the first 5xx counts.
+      - --enable-feature=created-timestamp-zero-ingestion
     volumes:
       - ./observability/prometheus.yaml:/etc/prometheus/prometheus.yaml:ro
       - prometheus:/prometheus

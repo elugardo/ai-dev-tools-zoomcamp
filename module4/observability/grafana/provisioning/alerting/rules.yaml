@@ -1,0 +1,64 @@
+# The alert: server errors on any route in the last 5 minutes.
+#
+# Evaluated every 10 s; fires after the condition has held for 30 s (it goes
+# through Pending first). The query ends in `or vector(0)` and noDataState is
+# OK, so a quiet period with no 5xx at all is Normal, not "No data".
+#
+# The payload carries what a responder needs to start: the endpoint (route
+# template), the time window, the dashboard, and ready-made Explore links for
+# the matching logs and failed traces.
+#
+# Grafana expands `$VAR` environment references in rule *labels* (but not in
+# annotations), so the label template is written `$$labels` to survive that,
+# while the annotations use plain `$labels` / `$values`.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: order-tracker
+    folder: Order Tracker
+    interval: 10s
+    rules:
+      - uid: order-tracker-5xx
+        title: Order Tracker 5xx responses
+        condition: C
+        for: 30s
+        noDataState: OK
+        execErrState: Error
+        data:
+          - refId: A
+            datasourceUid: prometheus
+            relativeTimeRange:
+              from: 300
+              to: 0
+            model:
+              refId: A
+              instant: true
+              expr: >-
+                sum by (http_route) (
+                  increase(http_server_request_duration_seconds_count{service_name="order-tracker", http_response_status_code=~"5.."}[5m])
+                ) or vector(0)
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    type: gt
+                    params: [0]
+        labels:
+          severity: critical
+          service: order-tracker
+          endpoint: "{{ $$labels.http_route }}"
+        annotations:
+          summary: "{{ $labels.http_route }} returned {{ printf \"%.0f\" $values.A }} server error(s) in the last 5 minutes"
+          description: "Users are getting 5xx responses from {{ $labels.http_route }} on the order-tracker app. Check the logs and failed traces linked below, then the recent changes."
+          endpoint: "{{ $labels.http_route }}"
+          window: 5m
+          dashboard: http://localhost:3000/d/order-tracker/order-tracker
+          __dashboardUid__: order-tracker
+          __panelId__: "2"
+          logs: 'http://localhost:3000/explore?schemaVersion=1&panes={"a":{"datasource":"loki","queries":[{"refId":"A","expr":"{service_name=\"order-tracker\"} | http_response_status_code >= 500"}],"range":{"from":"now-15m","to":"now"}}}'
+          traces: 'http://localhost:3000/explore?schemaVersion=1&panes={"a":{"datasource":"tempo","queries":[{"refId":"A","queryType":"traceql","query":"{resource.service.name=\"order-tracker\" && status=error}"}],"range":{"from":"now-15m","to":"now"}}}'
