@@ -3,10 +3,15 @@
 Repo for the AI Dev Tools Zoomcamp. Each module is its own self-contained
 project in a numbered folder, and nothing is shared between them.
 
+- **module4 — Order Tracker**, a FastAPI + SQLite order app, for the homework
+  on observability (OpenTelemetry, Grafana stack) and an alert-driven incident
+  responder. Current work. It has its own
+  [`module4/AGENTS.md`](module4/AGENTS.md); when working under `module4/`,
+  follow that file and ignore the rest of this one.
 - **module3 — Agent Relay**, a FastAPI + SQLite task relay for software agents,
-  for the homework on Docker, Compose, Kubernetes (kind) and CI.
-  Current work. It has its own [`module3/AGENTS.md`](module3/AGENTS.md); when
-  working under `module3/`, follow that file and ignore the rest of this one.
+  for the homework on Docker, Compose, Kubernetes (kind) and CI. It has its own
+  [`module3/AGENTS.md`](module3/AGENTS.md); when working under `module3/`,
+  follow that file and ignore the rest of this one.
 - **module2 — WaitWise**, a restaurant waitlist web app (React + TypeScript
   frontend, FastAPI backend). It has its own [`module2/AGENTS.md`](module2/AGENTS.md); when
   working under `module2/`, follow that file and ignore the rest of this one.
