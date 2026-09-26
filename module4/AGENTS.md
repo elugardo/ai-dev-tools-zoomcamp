@@ -37,11 +37,48 @@ Run from `module4/`:
 
 ```
 docker compose up --build -d --wait      # app on http://localhost:8000 (ORDER_TRACKER_PORT to change)
-docker compose logs app                  # app output, including console telemetry (step 2)
-docker compose down                      # stop; add -v to delete the orders volume too
+docker compose logs app                  # app output (OTEL_EXPORTER=console prints telemetry here)
+docker compose down                      # stop; add -v to delete the data volumes too
 uv sync                                  # create .venv and install deps (incl. dev)
 uv run --frozen pytest -q                # test suite
 ```
+
+The stack, after step 3 (all on 127.0.0.1):
+
+| Service | URL | Notes |
+|---|---|---|
+| app | http://localhost:8000 | sends OTLP to `otel-collector:4318` |
+| Grafana | http://localhost:3000 | anonymous admin, no login; dashboard "Order Tracker" |
+| Prometheus | http://localhost:9090 | scrapes the Collector's `:8889` every 5 s |
+| Loki | http://localhost:3100 | OTLP ingest at `/otlp`; labels `service_name`, `service_version` |
+| Tempo | http://localhost:3200 | OTLP gRPC on 4317 (inside the network) |
+
+Config lives in `observability/`: `otel-collector.yaml`, `prometheus.yaml`,
+`loki.yaml`, `tempo.yaml`, and `grafana/` (provisioned `datasources`,
+`dashboards` and, from step 4, `alerting`; the dashboard JSON is
+`grafana/dashboards/order-tracker.json`). Compose bind-mounts them read-only;
+after editing one, `docker compose restart <service>`.
+
+Checking a signal without the UI:
+
+```
+curl -s http://localhost:9090/api/v1/query --data-urlencode 'query=order_lookups_total'
+curl -s -G http://localhost:3100/loki/api/v1/query_range --data-urlencode 'query={service_name="order-tracker"} | order_id="standard-1002"'
+curl -s -G http://localhost:3200/api/search --data-urlencode 'q={span.order.id="standard-1002"}'
+curl -s http://localhost:3200/api/traces/<trace_id>
+```
+
+- **Metric names in Prometheus:** `http_server_request_duration_seconds_{count,sum,bucket}`
+  with labels `http_route`, `http_request_method`, `http_response_status_code`,
+  `service_name`, `service_version`; and `order_lookups_total` with
+  `http_response_status_code` and `outcome`.
+- **Log fields in Loki:** everything but the two stream labels is structured
+  metadata with dots turned into underscores: `trace_id`, `span_id`,
+  `order_id`, `http_response_status_code`, `severity_text`.
+- **Versions are pinned** in `compose.yaml` (Collector 0.161, Prometheus
+  v3.15, Loki 3.7, Tempo 3.0, Grafana 13.2). Tempo 3 has no `usage_report`
+  block, and the Collector's exporter types are `otlp_http` / `otlp_grpc`
+  with `resource_constant_labels` for resource-attribute labels.
 
 ## The app
 
