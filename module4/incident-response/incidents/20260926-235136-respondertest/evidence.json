@@ -1,0 +1,79 @@
+{
+  "collected_at": "2026-09-26T23:51:36Z",
+  "window": {
+    "from": "2026-09-26T23:36:36Z",
+    "to": "2026-09-26T23:51:36Z",
+    "minutes": 15
+  },
+  "alert": {
+    "status": "firing",
+    "labels": {
+      "alertname": "ResponderTest",
+      "test": "true"
+    },
+    "annotations": {
+      "summary": "Test notification; no incident to fix"
+    }
+  },
+  "errors": {},
+  "app": {
+    "healthz": {
+      "status_code": 200,
+      "body": "{\"status\":\"ok\"}"
+    },
+    "orders": {
+      "status_code": 200,
+      "body": [
+        {
+          "id": "standard-1001",
+          "customer": "Avery",
+          "item": "Notebook",
+          "priority": "standard",
+          "status": "received",
+          "created_at": "2026-09-26T22:42:53.475613+00:00"
+        },
+        {
+          "id": "standard-1003",
+          "customer": "Riley",
+          "item": "Water bottle",
+          "priority": "standard",
+          "status": "shipped",
+          "created_at": "2026-09-26T22:42:53.475613+00:00"
+        },
+        {
+          "id": "express-1002",
+          "customer": "Sam",
+          "item": "Headphones",
+          "priority": "express",
+          "status": "preparing",
+          "created_at": "2026-08-31T22:42:53.475613+00:00"
+        }
+      ]
+    }
+  },
+  "metrics": {
+    "requests_by_route_and_status": [
+      {
+        "http_request_method": "GET",
+        "http_response_status_code": "200",
+        "http_route": "/api/orders",
+        "value": 1.0
+      }
+    ],
+    "server_errors_by_route": [],
+    "order_lookups_by_outcome": []
+  },
+  "logs": {
+    "query": "{service_name=\"order-tracker\"} | http_response_status_code >= 500",
+    "server_error_logs": []
+  },
+  "traces": {
+    "query": "{resource.service.name=\"order-tracker\" && status=error}",
+    "failed_traces": []
+  },
+  "repo": {
+    "directory": "C:\\Projects\\ai-dev-tools-zoomcamp\\module4",
+    "recent_commits": "0aac6ba Module 4: Grafana alert on 5xx responses (Q4)\na29f1bc Module 4: telemetry pipeline with Collector, Prometheus, Loki, Tempo, Grafana (Q3)\n7eeeb01 Module 4: OpenTelemetry metrics, logs and traces for order lookups (Q2)\n328fb31 Module 4: Order Tracker starter and AGENTS.md",
+    "working_tree": "M pyproject.toml\n M uv.lock\n?? incident-response/\n?? tests/test_responder.py"
+  }
+}

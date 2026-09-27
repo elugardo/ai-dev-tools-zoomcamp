@@ -96,6 +96,27 @@ curl -s http://localhost:3200/api/traces/<trace_id>
   block, and the Collector's exporter types are `otlp_http` / `otlp_grpc`
   with `resource_constant_labels` for resource-attribute labels.
 
+The responder (step 5), on the host, from `module4/`:
+
+```
+uv run python incident-response/responder.py          # POST /alerts on 0.0.0.0:8001
+uv run --frozen pytest -q tests/test_responder.py     # dry-run tests, no agent
+curl -s http://localhost:8001/incidents               # state and RESULT line per incident
+```
+
+- Read [`incident-response/README.md`](incident-response/README.md) first.
+  `responder.py` is the FastAPI service, `evidence.py` the read-only
+  collector, `agent.py` runs `claude -p`, `prompt-template.md` is the brief.
+  Each incident is a folder under `incident-response/incidents/` and is
+  committed (the homework asks for the evidence); it holds no secrets.
+- It runs **on the host**, not in Compose: the agent needs the logged-in
+  `claude` CLI, the repo and the Docker CLI. Grafana reaches it as
+  `http://host.docker.internal:8001/alerts`.
+- The `claude` on PATH must be recent (`claude update`; 2.1.29 failed with
+  "version too old" for the default model).
+- The agent's answer ends with a `RESULT:` line; `status.json` carries state,
+  duration, turns, cost and that last line.
+
 ## The app
 
 ```
