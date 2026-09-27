@@ -1,0 +1,34 @@
+{
+  "status": "firing",
+  "labels": {
+    "alertname": "Order Tracker 5xx responses",
+    "endpoint": "/api/orders/{order_id}",
+    "grafana_folder": "Order Tracker",
+    "http_route": "/api/orders/{order_id}",
+    "service": "order-tracker",
+    "severity": "critical"
+  },
+  "annotations": {
+    "dashboard": "http://localhost:3000/d/order-tracker/order-tracker",
+    "description": "Users are getting 5xx responses from /api/orders/{order_id} on the order-tracker app. Check the logs and failed traces linked below, then the recent changes.",
+    "endpoint": "/api/orders/{order_id}",
+    "logs": "http://localhost:3000/explore?schemaVersion=1&panes={\"a\":{\"datasource\":\"loki\",\"queries\":[{\"refId\":\"A\",\"expr\":\"{service_name=\\\"order-tracker\\\"} | http_response_status_code >= 500\"}],\"range\":{\"from\":\"now-15m\",\"to\":\"now\"}}}",
+    "summary": "/api/orders/{order_id} returned {map[%!f(string=):%!f(string=)] 4 %!f(bool=true)} server error(s) in the last 5 minutes",
+    "traces": "http://localhost:3000/explore?schemaVersion=1&panes={\"a\":{\"datasource\":\"tempo\",\"queries\":[{\"refId\":\"A\",\"queryType\":\"traceql\",\"query\":\"{resource.service.name=\\\"order-tracker\\\" && status=error}\"}],\"range\":{\"from\":\"now-15m\",\"to\":\"now\"}}}",
+    "window": "5m"
+  },
+  "startsAt": "2026-09-27T00:02:50Z",
+  "endsAt": "0001-01-01T00:00:00Z",
+  "generatorURL": "http://localhost:3000/alerting/grafana/order-tracker-5xx/view?orgId=1",
+  "fingerprint": "d38018605b6c812a",
+  "silenceURL": "http://localhost:3000/alerting/silence/new?alertmanager=grafana&matcher=__alert_rule_uid__%3Dorder-tracker-5xx&matcher=endpoint%3D%2Fapi%2Forders%2F%7Border_id%7D&matcher=http_route%3D%2Fapi%2Forders%2F%7Border_id%7D&matcher=service%3Dorder-tracker&matcher=severity%3Dcritical&orgId=1",
+  "dashboardURL": "http://localhost:3000/d/order-tracker?from=1790463770000&orgId=1&to=1790467397315",
+  "panelURL": "http://localhost:3000/d/order-tracker?from=1790463770000&orgId=1&to=1790467397315&viewPanel=2",
+  "ruleUID": "order-tracker-5xx",
+  "values": {
+    "A": 4.093073277433467,
+    "C": 1
+  },
+  "valueString": "[ var='A' labels={http_route=/api/orders/{order_id}} type='query' value=4.093073277433467 ], [ var='C' labels={http_route=/api/orders/{order_id}} type='threshold' value=1 ]",
+  "orgId": 1
+}

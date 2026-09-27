@@ -1,0 +1,24 @@
+# Where alerts go: the incident responder on the host (see
+# incident-response/), reached from inside Docker as host.docker.internal.
+# The policy routes everything there, grouped per alert and endpoint, with a
+# short group wait so the webhook arrives soon after the alert fires.
+apiVersion: 1
+
+contactPoints:
+  - orgId: 1
+    name: incident-responder
+    receivers:
+      - uid: incident-responder
+        type: webhook
+        disableResolveMessage: false
+        settings:
+          url: http://host.docker.internal:8001/alerts
+          httpMethod: POST
+
+policies:
+  - orgId: 1
+    receiver: incident-responder
+    group_by: [alertname, endpoint]
+    group_wait: 10s
+    group_interval: 30s
+    repeat_interval: 5m

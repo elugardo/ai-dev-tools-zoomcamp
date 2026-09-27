@@ -1,0 +1,482 @@
+{
+  "collected_at": "2026-09-27T00:03:17Z",
+  "window": {
+    "from": "2026-09-26T23:48:17Z",
+    "to": "2026-09-27T00:03:17Z",
+    "minutes": 15
+  },
+  "alert": {
+    "status": "firing",
+    "labels": {
+      "alertname": "Order Tracker 5xx responses",
+      "endpoint": "/api/orders/{order_id}",
+      "grafana_folder": "Order Tracker",
+      "http_route": "/api/orders/{order_id}",
+      "service": "order-tracker",
+      "severity": "critical"
+    },
+    "annotations": {
+      "dashboard": "http://localhost:3000/d/order-tracker/order-tracker",
+      "description": "Users are getting 5xx responses from /api/orders/{order_id} on the order-tracker app. Check the logs and failed traces linked below, then the recent changes.",
+      "endpoint": "/api/orders/{order_id}",
+      "logs": "http://localhost:3000/explore?schemaVersion=1&panes={\"a\":{\"datasource\":\"loki\",\"queries\":[{\"refId\":\"A\",\"expr\":\"{service_name=\\\"order-tracker\\\"} | http_response_status_code >= 500\"}],\"range\":{\"from\":\"now-15m\",\"to\":\"now\"}}}",
+      "summary": "/api/orders/{order_id} returned {map[%!f(string=):%!f(string=)] 4 %!f(bool=true)} server error(s) in the last 5 minutes",
+      "traces": "http://localhost:3000/explore?schemaVersion=1&panes={\"a\":{\"datasource\":\"tempo\",\"queries\":[{\"refId\":\"A\",\"queryType\":\"traceql\",\"query\":\"{resource.service.name=\\\"order-tracker\\\" && status=error}\"}],\"range\":{\"from\":\"now-15m\",\"to\":\"now\"}}}",
+      "window": "5m"
+    },
+    "startsAt": "2026-09-27T00:02:50Z",
+    "endsAt": "0001-01-01T00:00:00Z",
+    "generatorURL": "http://localhost:3000/alerting/grafana/order-tracker-5xx/view?orgId=1",
+    "fingerprint": "d38018605b6c812a",
+    "silenceURL": "http://localhost:3000/alerting/silence/new?alertmanager=grafana&matcher=__alert_rule_uid__%3Dorder-tracker-5xx&matcher=endpoint%3D%2Fapi%2Forders%2F%7Border_id%7D&matcher=http_route%3D%2Fapi%2Forders%2F%7Border_id%7D&matcher=service%3Dorder-tracker&matcher=severity%3Dcritical&orgId=1",
+    "dashboardURL": "http://localhost:3000/d/order-tracker?from=1790463770000&orgId=1&to=1790467397315",
+    "panelURL": "http://localhost:3000/d/order-tracker?from=1790463770000&orgId=1&to=1790467397315&viewPanel=2",
+    "ruleUID": "order-tracker-5xx",
+    "values": {
+      "A": 4.093073277433467,
+      "C": 1
+    },
+    "valueString": "[ var='A' labels={http_route=/api/orders/{order_id}} type='query' value=4.093073277433467 ], [ var='C' labels={http_route=/api/orders/{order_id}} type='threshold' value=1 ]",
+    "orgId": 1
+  },
+  "errors": {},
+  "app": {
+    "healthz": {
+      "status_code": 200,
+      "body": "{\"status\":\"ok\"}"
+    },
+    "orders": {
+      "status_code": 200,
+      "body": [
+        {
+          "id": "standard-1001",
+          "customer": "Avery",
+          "item": "Notebook",
+          "priority": "standard",
+          "status": "received",
+          "created_at": "2026-09-26T22:42:53.475613+00:00"
+        },
+        {
+          "id": "standard-1003",
+          "customer": "Riley",
+          "item": "Water bottle",
+          "priority": "standard",
+          "status": "shipped",
+          "created_at": "2026-09-26T22:42:53.475613+00:00"
+        },
+        {
+          "id": "express-1002",
+          "customer": "Sam",
+          "item": "Headphones",
+          "priority": "express",
+          "status": "preparing",
+          "created_at": "2026-08-31T22:42:53.475613+00:00"
+        }
+      ]
+    }
+  },
+  "metrics": {
+    "requests_by_route_and_status": [
+      {
+        "http_request_method": "GET",
+        "http_response_status_code": "200",
+        "http_route": "/api/orders",
+        "value": 2.01
+      },
+      {
+        "http_request_method": "GET",
+        "http_response_status_code": "500",
+        "http_route": "/api/orders/{order_id}",
+        "value": 4.12
+      }
+    ],
+    "server_errors_by_route": [
+      {
+        "http_route": "/api/orders/{order_id}",
+        "value": 4.12
+      }
+    ],
+    "order_lookups_by_outcome": [
+      {
+        "http_response_status_code": "500",
+        "outcome": "error",
+        "value": 4.12
+      }
+    ]
+  },
+  "logs": {
+    "query": "{service_name=\"order-tracker\"} | http_response_status_code >= 500",
+    "server_error_logs": [
+      {
+        "timestamp": "2026-09-27T00:02:01Z",
+        "line": "order lookup failed",
+        "trace_id": "a128c36a9184c8ef2c151315275cd730",
+        "order_id": "express-1002",
+        "status_code": "500",
+        "severity": "ERROR",
+        "exception_type": "ValueError",
+        "exception_message": "day is out of range for month",
+        "exception_stacktrace": "Traceback (most recent call last):\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+        "code": {
+          "file_path": "/app/app/main.py",
+          "function_name": "get_order",
+          "line_number": "135"
+        }
+      },
+      {
+        "timestamp": "2026-09-27T00:01:59Z",
+        "line": "order lookup failed",
+        "trace_id": "b71e7392b230a9f16ace1de1275d3703",
+        "order_id": "express-1002",
+        "status_code": "500",
+        "severity": "ERROR",
+        "exception_type": "ValueError",
+        "exception_message": "day is out of range for month",
+        "exception_stacktrace": "Traceback (most recent call last):\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+        "code": {
+          "file_path": "/app/app/main.py",
+          "function_name": "get_order",
+          "line_number": "135"
+        }
+      },
+      {
+        "timestamp": "2026-09-27T00:01:57Z",
+        "line": "order lookup failed",
+        "trace_id": "f3c8e53b6a7f2d331fbcd2990cd2620c",
+        "order_id": "express-1002",
+        "status_code": "500",
+        "severity": "ERROR",
+        "exception_type": "ValueError",
+        "exception_message": "day is out of range for month",
+        "exception_stacktrace": "Traceback (most recent call last):\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+        "code": {
+          "file_path": "/app/app/main.py",
+          "function_name": "get_order",
+          "line_number": "135"
+        }
+      },
+      {
+        "timestamp": "2026-09-27T00:00:57Z",
+        "line": "order lookup failed",
+        "trace_id": "63d435261f84c88b7a9b6a15a7fdbd80",
+        "order_id": "express-1002",
+        "status_code": "500",
+        "severity": "ERROR",
+        "exception_type": "ValueError",
+        "exception_message": "day is out of range for month",
+        "exception_stacktrace": "Traceback (most recent call last):\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+        "code": {
+          "file_path": "/app/app/main.py",
+          "function_name": "get_order",
+          "line_number": "135"
+        }
+      }
+    ]
+  },
+  "traces": {
+    "query": "{resource.service.name=\"order-tracker\" && status=error}",
+    "failed_traces": [
+      {
+        "trace_id": "a128c36a9184c8ef2c151315275cd730",
+        "root": "GET /api/orders/{order_id}",
+        "spans": [
+          {
+            "name": "SELECT orders",
+            "status": "ok",
+            "attributes": {
+              "db.system.name": "sqlite",
+              "db.operation.name": "SELECT",
+              "db.collection.name": "orders"
+            }
+          },
+          {
+            "name": "order.lookup",
+            "status": "ok",
+            "attributes": {
+              "order.id": "express-1002"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 602, in use_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/sdk/trace/__init__.py\", line 1136, in start_as_current_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 441, in start_as_current_span\n    yield span\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+                "exception.escaped": "False"
+              }
+            ]
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.start",
+              "http.response.status_code": "500",
+              "error.type": "500"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.body"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id}",
+            "status": "ok",
+            "attributes": {
+              "url.scheme": "http",
+              "server.port": "8000",
+              "network.protocol.version": "1.1",
+              "user_agent.original": "curl/7.73.0",
+              "client.address": "10.215.24.1",
+              "client.port": "60544",
+              "http.response.status_code": "500",
+              "error.type": "500",
+              "http.request.method": "GET",
+              "url.path": "/api/orders/express-1002",
+              "server.address": "10.215.24.4:8000",
+              "http.route": "/api/orders/{order_id}"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/instrumentation/fastapi/__init__.py\", line 360, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py\", line 63, in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py\", line 18, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 676, in __call__\n    await self.middleware_stack(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 2734, in app\n    await route.handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 1281, in handle\n    await super().handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 282, in handle\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 158, in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 144, in app\n    response = await f(request)\n               ^^^^^^^^^^^^^^^^\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 706, in app\n    raw_response = await run_endpoint_functio",
+                "exception.escaped": "False"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trace_id": "b71e7392b230a9f16ace1de1275d3703",
+        "root": "GET /api/orders/{order_id}",
+        "spans": [
+          {
+            "name": "SELECT orders",
+            "status": "ok",
+            "attributes": {
+              "db.system.name": "sqlite",
+              "db.operation.name": "SELECT",
+              "db.collection.name": "orders"
+            }
+          },
+          {
+            "name": "order.lookup",
+            "status": "ok",
+            "attributes": {
+              "order.id": "express-1002"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 602, in use_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/sdk/trace/__init__.py\", line 1136, in start_as_current_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 441, in start_as_current_span\n    yield span\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+                "exception.escaped": "False"
+              }
+            ]
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.start",
+              "http.response.status_code": "500",
+              "error.type": "500"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.body"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id}",
+            "status": "ok",
+            "attributes": {
+              "url.scheme": "http",
+              "server.port": "8000",
+              "network.protocol.version": "1.1",
+              "user_agent.original": "curl/7.73.0",
+              "client.address": "10.215.24.1",
+              "client.port": "60540",
+              "http.response.status_code": "500",
+              "error.type": "500",
+              "http.request.method": "GET",
+              "url.path": "/api/orders/express-1002",
+              "server.address": "10.215.24.4:8000",
+              "http.route": "/api/orders/{order_id}"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/instrumentation/fastapi/__init__.py\", line 360, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py\", line 63, in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py\", line 18, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 676, in __call__\n    await self.middleware_stack(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 2734, in app\n    await route.handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 1281, in handle\n    await super().handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 282, in handle\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 158, in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 144, in app\n    response = await f(request)\n               ^^^^^^^^^^^^^^^^\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 706, in app\n    raw_response = await run_endpoint_functio",
+                "exception.escaped": "False"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trace_id": "f3c8e53b6a7f2d331fbcd2990cd2620c",
+        "root": "GET /api/orders/{order_id}",
+        "spans": [
+          {
+            "name": "SELECT orders",
+            "status": "ok",
+            "attributes": {
+              "db.system.name": "sqlite",
+              "db.operation.name": "SELECT",
+              "db.collection.name": "orders"
+            }
+          },
+          {
+            "name": "order.lookup",
+            "status": "ok",
+            "attributes": {
+              "order.id": "express-1002"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 602, in use_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/sdk/trace/__init__.py\", line 1136, in start_as_current_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 441, in start_as_current_span\n    yield span\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+                "exception.escaped": "False"
+              }
+            ]
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.start",
+              "http.response.status_code": "500",
+              "error.type": "500"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.body"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id}",
+            "status": "ok",
+            "attributes": {
+              "url.scheme": "http",
+              "server.port": "8000",
+              "network.protocol.version": "1.1",
+              "user_agent.original": "curl/7.73.0",
+              "client.address": "10.215.24.1",
+              "client.port": "60526",
+              "http.response.status_code": "500",
+              "error.type": "500",
+              "http.request.method": "GET",
+              "url.path": "/api/orders/express-1002",
+              "server.address": "10.215.24.4:8000",
+              "http.route": "/api/orders/{order_id}"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/instrumentation/fastapi/__init__.py\", line 360, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py\", line 63, in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py\", line 18, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 676, in __call__\n    await self.middleware_stack(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 2734, in app\n    await route.handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 1281, in handle\n    await super().handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 282, in handle\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 158, in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 144, in app\n    response = await f(request)\n               ^^^^^^^^^^^^^^^^\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 706, in app\n    raw_response = await run_endpoint_functio",
+                "exception.escaped": "False"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "trace_id": "63d435261f84c88b7a9b6a15a7fdbd80",
+        "root": "GET /api/orders/{order_id}",
+        "spans": [
+          {
+            "name": "SELECT orders",
+            "status": "ok",
+            "attributes": {
+              "db.system.name": "sqlite",
+              "db.operation.name": "SELECT",
+              "db.collection.name": "orders"
+            }
+          },
+          {
+            "name": "order.lookup",
+            "status": "ok",
+            "attributes": {
+              "order.id": "express-1002"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 602, in use_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/sdk/trace/__init__.py\", line 1136, in start_as_current_span\n    yield span\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/trace/__init__.py\", line 441, in start_as_current_span\n    yield span\n  File \"/app/app/main.py\", line 125, in get_order\n    order = load_order(order_id)\n            ^^^^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 114, in load_order\n    return order_detail(row)\n           ^^^^^^^^^^^^^^^^^\n  File \"/app/app/main.py\", line 62, in order_detail\n    estimated_at = placed_at.replace(day=placed_at.day + 2)\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\nValueError: day is out of range for month\n",
+                "exception.escaped": "False"
+              }
+            ]
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.start",
+              "http.response.status_code": "500",
+              "error.type": "500"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id} http send",
+            "status": "ok",
+            "attributes": {
+              "asgi.event.type": "http.response.body"
+            }
+          },
+          {
+            "name": "GET /api/orders/{order_id}",
+            "status": "ok",
+            "attributes": {
+              "url.scheme": "http",
+              "server.port": "8000",
+              "network.protocol.version": "1.1",
+              "user_agent.original": "curl/7.73.0",
+              "client.address": "10.215.24.1",
+              "client.port": "48394",
+              "http.response.status_code": "500",
+              "error.type": "500",
+              "http.request.method": "GET",
+              "url.path": "/api/orders/express-1002",
+              "server.address": "10.215.24.4:8000",
+              "http.route": "/api/orders/{order_id}"
+            },
+            "events": [
+              {
+                "name": "exception",
+                "exception.type": "ValueError",
+                "exception.message": "day is out of range for month",
+                "exception.stacktrace": "Traceback (most recent call last):\n  File \"/app/.venv/lib/python3.12/site-packages/opentelemetry/instrumentation/fastapi/__init__.py\", line 360, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/middleware/exceptions.py\", line 63, in __call__\n    await wrap_app_handling_exceptions(self.app, conn)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/middleware/asyncexitstack.py\", line 18, in __call__\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 676, in __call__\n    await self.middleware_stack(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 2734, in app\n    await route.handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 1281, in handle\n    await super().handle(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/routing.py\", line 282, in handle\n    await self.app(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 158, in app\n    await wrap_app_handling_exceptions(app, request)(scope, receive, send)\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 53, in wrapped_app\n    raise exc\n  File \"/app/.venv/lib/python3.12/site-packages/starlette/_exception_handler.py\", line 42, in wrapped_app\n    await app(scope, receive, sender)\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 144, in app\n    response = await f(request)\n               ^^^^^^^^^^^^^^^^\n  File \"/app/.venv/lib/python3.12/site-packages/fastapi/routing.py\", line 706, in app\n    raw_response = await run_endpoint_functio",
+                "exception.escaped": "False"
+              }
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "repo": {
+    "directory": "C:\\Projects\\ai-dev-tools-zoomcamp\\module4",
+    "recent_commits": "55b587e Module 4: incident responder that runs Claude Code headless (Q5)\n0aac6ba Module 4: Grafana alert on 5xx responses (Q4)\na29f1bc Module 4: telemetry pipeline with Collector, Prometheus, Loki, Tempo, Grafana (Q3)\n7eeeb01 Module 4: OpenTelemetry metrics, logs and traces for order lookups (Q2)\n328fb31 Module 4: Order Tracker starter and AGENTS.md",
+    "working_tree": "M compose.yaml\n?? incident-response/incidents/20260927-000317-order-tracker-5xx-responses/\n?? observability/grafana/provisioning/alerting/contact-points.yaml"
+  }
+}

@@ -116,6 +116,16 @@ curl -s http://localhost:8001/incidents               # state and RESULT line pe
   "version too old" for the default model).
 - The agent's answer ends with a `RESULT:` line; `status.json` carries state,
   duration, turns, cost and that last line.
+- **The webhook (step 6)** is provisioned in
+  `observability/grafana/provisioning/alerting/contact-points.yaml`: contact
+  point `incident-responder` → `http://host.docker.internal:8001/alerts`, and
+  a root notification policy grouped by `alertname, endpoint` with
+  `group_wait: 10s`, `group_interval: 30s`, `repeat_interval: 5m`. Grafana's
+  resolved notification lands in the incident as `resolved.json`.
+- **Timing of the real incident:** 500 at t=0, alert Pending at ~20 s,
+  Firing at ~50 s, webhook received at ~80 s, agent done after 212 s
+  (17 turns). The alert returns to Normal on its own once the 5-minute window
+  has no more 5xx.
 
 ## The app
 
@@ -150,10 +160,15 @@ module4/
 
 ## Rules
 
-- **Do not fix the `express-1002` failure ahead of step 6.** `GET
-  /api/orders/express-1002` returning a 500 *is* the incident: the alert must
-  catch it and the responder's headless agent must diagnose and fix it from the
-  telemetry. Until then, leave `order_detail()` as it is.
+- **The `express-1002` incident is done (step 6).** The starter shipped
+  `order_detail()` computing the express delivery estimate with
+  `placed_at.replace(day=placed_at.day + 2)`, which raised `ValueError: day is
+  out of range for month` for an order placed on the last two days of a month.
+  The headless agent diagnosed it from the alert's evidence and replaced it
+  with `placed_at + timedelta(days=2)`, with tests. See
+  `incident-response/incidents/20260927-000317-order-tracker-5xx-responses/`.
+  Do not reintroduce the bug to "re-run" the exercise; the incident folder is
+  the record.
 - **Keep the starter's behaviour.** Instrumentation must not change any
   response. The starter tests must keep passing.
 - **Signals must not leak secrets or bloat cardinality.** No request headers
