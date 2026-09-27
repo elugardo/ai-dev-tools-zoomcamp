@@ -8,6 +8,7 @@ in its own numbered folder.
 | [Module 1](#module-1--city-journal) | City Journal: a personal place-journal CLI | Python, Django, SQLite |
 | [Module 2](#module-2--waitwise) | WaitWise: a restaurant waitlist manager | React, TypeScript, Vite, FastAPI |
 | [Module 3](#module-3--agent-relay) | Agent Relay: containerize and deploy a task relay for agents | FastAPI, PostgreSQL, Docker, Compose, Kubernetes (kind), GitHub Actions (act) |
+| [Module 4](#module-4--order-tracker) | Order Tracker: observability and an alert-driven incident responder | FastAPI, OpenTelemetry, Collector, Prometheus, Loki, Tempo, Grafana, Claude Code headless |
 
 ## Module 1 — City Journal
 
@@ -174,7 +175,7 @@ module1/
 | [`module1/_docs/tasks.md`](module1/_docs/tasks.md) | The ten-task backlog, mirrored as issues [#1–#10](https://github.com/elugardo/ai-dev-tools-zoomcamp/issues) |
 | [`module1/_docs/process.md`](module1/_docs/process.md) | How work is picked up, branched, committed, and closed |
 | [`module1/_docs/testing-guidelines.md`](module1/_docs/testing-guidelines.md) | Testing conventions |
-| [`AGENTS.md`](AGENTS.md) | Commands and rules for coding agents working in module 1 (module 2 and module 3 have [their](module2/AGENTS.md) [own](module3/AGENTS.md)) |
+| [`AGENTS.md`](AGENTS.md) | Commands and rules for coding agents working in module 1 (modules [2](module2/AGENTS.md), [3](module3/AGENTS.md) and [4](module4/AGENTS.md) have their own) |
 
 ### Status
 
@@ -654,3 +655,111 @@ watch its tasks. The exact requests are in [`module3/README.md`](module3/README.
 | 4. Hostname for the `postgres` service in Compose | `postgres` |
 | 5. Resource that keeps replicas running and manages updates | `Deployment` |
 | 6. If a test fails in the workflow | Keep the existing version running and stop the deployment |
+
+## Module 4 — Order Tracker
+
+[Homework 4](https://github.com/DataTalksClub/ai-dev-tools-zoomcamp/blob/main/cohorts/2026/homework/04-devops/homework.md)
+is about knowing when an app is broken and letting an agent deal with it. The
+app is [Order Tracker](https://github.com/alexeygrigorev/order-tracker), a
+small FastAPI service for creating orders and checking their status, with a
+bug planted in it: looking up an express order placed at the end of a month
+returns a 500. The work adds observability around it, an alert on real user
+impact, and a responder that hands the alert to Claude Code running headless.
+
+```
+request ──▶ app ──OTLP──▶ Collector ──▶ Prometheus / Loki / Tempo ──▶ Grafana
+                                                                        │ alert (5xx)
+                                                                        ▼ webhook
+                          incidents/<id>/ ◀── responder (:8001) ──▶ claude -p ──▶ fix, test, rebuild, report
+```
+
+| Step | What was done | Where |
+|---|---|---|
+| 1. Run the app | `docker compose up --build -d --wait`; `/healthz` | [`compose.yaml`](module4/compose.yaml) |
+| 2. Instrument one endpoint | OpenTelemetry metrics, logs and traces for order lookups; console export first | [`app/telemetry.py`](module4/app/telemetry.py), [`app/main.py`](module4/app/main.py) |
+| 3. Telemetry pipeline | Collector → Prometheus, Loki, Tempo; Grafana provisioned with linked datasources and a dashboard | [`observability/`](module4/observability/) |
+| 4. Alert | Per-route 5xx rule with endpoint, window and dashboard/log/trace links; quiet periods are Normal | [`alerting/rules.yaml`](module4/observability/grafana/provisioning/alerting/rules.yaml) |
+| 5. Responder | `POST /alerts` on 8001: saves the alert, collects evidence, runs Claude Code headless | [`incident-response/`](module4/incident-response/) |
+| 6. The incident | Grafana webhook → responder → agent found and fixed the bug, rebuilt and verified the app | [`incidents/20260927-000317-…`](module4/incident-response/incidents/20260927-000317-order-tracker-5xx-responses/) |
+
+### Running it
+
+From `module4/`, with Docker Desktop, [uv](https://docs.astral.sh/uv/) and a
+logged-in `claude` CLI (2.1.251 or newer):
+
+| Goal | Commands |
+|---|---|
+| The whole stack | `docker compose up --build -d --wait`; app on http://localhost:8000, Grafana on http://localhost:3000 (no login), Prometheus 9090, Loki 3100, Tempo 3200 |
+| The tests | `uv sync` then `uv run --frozen pytest -q` (app tests and responder dry-run tests) |
+| Telemetry on stdout instead (step 2) | `OTEL_EXPORTER=console docker compose up --build -d --wait` then `docker compose logs app` |
+| The responder | `uv run python incident-response/responder.py`, then `curl -X POST http://localhost:8001/alerts …` (test payload in its [README](module4/incident-response/README.md)); `GET /incidents` lists states |
+| The dashboard and alert | http://localhost:3000/d/order-tracker and http://localhost:3000/alerting/list |
+
+### How it is built
+
+- **Instrumentation** (step 2) lives in one module with an `OTEL_EXPORTER`
+  switch: `console`, `otlp` (the default in Compose) or `none` (tests). The
+  request histogram carries the route template, method and status code; an
+  `order.lookups` counter carries the outcome; the lookup gets its own span
+  with the order id and a `SELECT orders` span; every log line carries the
+  trace id, and a failed lookup logs the traceback. Nothing captures headers or
+  bodies, and metric labels never include the order id.
+- **Pipeline** (step 3): everything is configuration in the repo, including
+  Grafana's datasources (a log line's `trace_id` opens the trace; a trace links
+  to its logs), the dashboard and the alert. Versions are pinned.
+- **Alert** (step 4): `increase()` of 5xx per route over 5 minutes, evaluated
+  every 10 s, Pending 30 s, then Firing. `or vector(0)` plus `noDataState: OK`
+  make quiet periods Normal. Prometheus runs with created-timestamp zero
+  ingestion so the very first error on a new series already counts.
+- **Responder** (step 5) runs on the host, because the agent needs the `claude`
+  CLI, the repo and the Docker CLI; Grafana reaches it as
+  `host.docker.internal`. It collects a bounded, read-only evidence packet
+  (app health and orders, request and error counts, 5xx logs with tracebacks,
+  failed traces with exception events, recent commits) and starts
+  `claude -p` with a written brief, a tool allowlist and a turn limit. The
+  brief says: stop on a test alert; otherwise fix under `app/`, add a test,
+  rebuild only `app`, verify, write `report.md`, end with one `RESULT:` line.
+  Every incident is a folder with the full trail, committed as evidence.
+
+### The incident (step 6)
+
+Three `GET /api/orders/express-1002` requests returned 500. The alert went
+Pending after ~20 s and Firing after ~50 s; Grafana's webhook reached the
+responder ~80 s after the first error. The agent read the evidence (four error
+logs and four failed traces, all `ValueError: day is out of range for month` on
+the `order.lookup` span), found the cause at `app/main.py:62`, where the
+express delivery estimate was computed with
+`placed_at.replace(day=placed_at.day + 2)` (August 31 → "August 33"), changed
+it to `placed_at + timedelta(days=2)`, added tests for month end, a 30-day
+month, year end and leap-year February, rebuilt only the `app` service and
+verified `express-1002` → 200. It took 212 s and 17 turns, changed only
+`app/main.py` and `tests/test_api.py`, and did not commit; its
+[report](module4/incident-response/incidents/20260927-000317-order-tracker-5xx-responses/report.md)
+is in the incident folder. The alert returned to Normal by itself, and
+Grafana's resolved notification was recorded too.
+
+### Where this differs from what the homework expects
+
+- **No GitHub fork.** The starter was copied into `module4/` (upstream commit
+  `72de447`, no git history), like the other modules.
+- **The responder runs on the host, not in Compose,** for the reasons above.
+- **Two tools were updated along the way:** the `claude` CLI (2.1.29 was
+  rejected by the API as too old; `claude update` fixed it) and, in Compose,
+  current image versions: Tempo 3 has no `usage_report` block, the Collector's
+  exporters are `otlp_http`/`otlp_grpc` with `resource_constant_labels`, and
+  Grafana 13 env-expands `$VAR` in alert labels (hence `$$labels`) but not in
+  annotations.
+- **The sqlite3 auto-instrumentation is not used:** the app calls
+  `connection.execute()`, whose cursor is created in C, so it produces no
+  spans; the lookup has an explicit query span instead.
+
+### Homework answers
+
+| Question | Answer |
+|---|---|
+| 1. What the health check returns | `{"status":"ok"}` |
+| 2. Status code the metric records for `standard-1001` | `200` |
+| 3. Status code the metric shows for `standard-1002` | `404` |
+| 4. Alert state after that lookup | `Normal` |
+| 5. The agent's last line for the test alert | `RESULT: no incident (test alert); nothing changed` |
+| 6. What the problem was | The express delivery date calculation tried to use a day that does not exist in that month |
